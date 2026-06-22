@@ -39,86 +39,144 @@ public struct ContentView: View {
     public var body: some View {
         NavigationStack {
             HSplitView {
-                // Main split: Left Side (Directory list + Treemap)
-                VSplitView {
-                    // Top: Directory list outline
-                    VStack(alignment: .leading, spacing: 0) {
-                        HStack {
-                            Text("Folder Structure")
-                                .font(.system(size: 11, weight: .semibold))
-                                .foregroundStyle(.secondary)
-                            Spacer()
-                            if let root = viewModel.rootItem {
-                                Text("Root: \(root.path)")
-                                    .font(.system(size: 10))
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(1)
-                                    .truncationMode(.middle)
-                            }
-                        }
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 6)
-                        .background(Color(NSColor.windowBackgroundColor))
-                        
-                        Divider()
-                        
-                        if let root = viewModel.rootItem {
-                            // Custom Tree outline list view
-                            List(selection: $viewModel.selectedItem) {
-                                OutlineGroup(root, children: \.children) { item in
-                                    HStack(spacing: 8) {
-                                        Image(systemName: item.type == .directory ? "folder.fill" : "doc.fill")
-                                            .font(.system(size: 12))
-                                            .foregroundStyle(item.type == .directory ? .blue : .secondary)
-                                            .frame(width: 14)
-                                        
-                                        Text(item.name)
-                                            .font(.system(size: 12))
-                                            .lineLimit(1)
-                                        
-                                        Spacer()
-                                        
-                                        // Count of immediate children if directory
-                                        if item.type == .directory {
-                                            Text("\(item.childCount) items")
-                                                .font(.system(size: 10))
-                                                .foregroundStyle(.tertiary)
+                // Main split: Left Side (Directory list + Treemap or Centered Hub)
+                Group {
+                    if let root = viewModel.rootItem {
+                        VSplitView {
+                            // Top: Directory list outline
+                            VStack(alignment: .leading, spacing: 0) {
+                                HStack {
+                                    Text("Folder Structure")
+                                        .font(.system(size: 11, weight: .semibold))
+                                        .foregroundStyle(.secondary)
+                                    Spacer()
+                                    Text("Root: \(root.path)")
+                                        .font(.system(size: 10))
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                        .truncationMode(.middle)
+                                }
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 6)
+                                .background(Color(NSColor.windowBackgroundColor))
+                                
+                                Divider()
+                                
+                                List(selection: $viewModel.selectedItem) {
+                                    OutlineGroup(root, children: \.children) { item in
+                                        HStack(spacing: 8) {
+                                            Image(systemName: item.type == .directory ? "folder.fill" : "doc.fill")
+                                                .font(.system(size: 12))
+                                                .foregroundStyle(item.type == .directory ? .blue : .secondary)
+                                                .frame(width: 14)
+                                            
+                                            Text(item.name)
+                                                .font(.system(size: 12))
+                                                .lineLimit(1)
+                                            
+                                            Spacer()
+                                            
+                                            // Count of immediate children if directory
+                                            if item.type == .directory {
+                                                Text("\(item.childCount) items")
+                                                    .font(.system(size: 10))
+                                                    .foregroundStyle(.tertiary)
+                                            }
+                                            
+                                            // Human readable size
+                                            Text(formattedSize(item.size))
+                                                .font(.system(size: 11, design: .monospaced))
+                                                .foregroundStyle(.primary)
+                                                .frame(width: 80, alignment: .trailing)
+                                            
+                                            // Visual space ratio bar
+                                            PercentageBar(percentage: item.percentageOfParent)
+                                                .frame(width: 50, height: 6)
+                                                .padding(.leading, 4)
                                         }
-                                        
-                                        // Human readable size
-                                        Text(formattedSize(item.size))
-                                            .font(.system(size: 11, design: .monospaced))
-                                            .foregroundStyle(.primary)
-                                            .frame(width: 80, alignment: .trailing)
-                                        
-                                        // Visual space ratio bar
-                                        PercentageBar(percentage: item.percentageOfParent)
-                                            .frame(width: 50, height: 6)
-                                            .padding(.leading, 4)
-                                    }
-                                    .tag(item)
-                                    .contextMenu {
-                                        Button("Reveal in Finder") {
-                                            NSWorkspace.shared.selectFile(item.path, inFileViewerRootedAtPath: "")
-                                        }
-                                        Button("Copy Path") {
-                                            NSPasteboard.general.clearContents()
-                                            NSPasteboard.general.setString(item.path, forType: .string)
+                                        .tag(item)
+                                        .contextMenu {
+                                            Button("Reveal in Finder") {
+                                                NSWorkspace.shared.selectFile(item.path, inFileViewerRootedAtPath: "")
+                                            }
+                                            Button("Copy Path") {
+                                                NSPasteboard.general.clearContents()
+                                                NSPasteboard.general.setString(item.path, forType: .string)
+                                            }
                                         }
                                     }
                                 }
+                                .listStyle(.sidebar)
                             }
-                            .listStyle(.sidebar)
-                        } else {
-                            VStack {
+                            .frame(minHeight: 150)
+                            
+                            // Bottom: Treemap View
+                            VStack(alignment: .leading, spacing: 0) {
+                                HStack {
+                                    Text("Interactive Treemap Layout (Top Files)")
+                                        .font(.system(size: 11, weight: .semibold))
+                                        .foregroundStyle(.secondary)
+                                    Spacer()
+                                    if let focused = viewModel.treemapRoot {
+                                        Text("Focusing: \(focused.name)")
+                                            .font(.system(size: 10, weight: .medium))
+                                            .foregroundStyle(.blue)
+                                    }
+                                }
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 6)
+                                .background(Color(NSColor.windowBackgroundColor))
+                                
+                                Divider()
+                                
+                                TreemapView(rootItem: viewModel.treemapRoot, selectedItem: $viewModel.selectedItem)
+                            }
+                            .frame(minHeight: 150)
+                        }
+                    } else if viewModel.isScanning {
+                        // Beautiful, completely centered loading / scanning view
+                        VStack(spacing: 20) {
+                            ProgressView()
+                                .controlSize(.large)
+                            
+                            Text("Analyzing Volume Storage...")
+                                .font(.system(size: 16, weight: .bold))
+                            
+                            if let progress = viewModel.scanProgress {
+                                Text(progress.currentItemPath)
+                                    .font(.system(size: 11, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                    .frame(width: 440)
+                                
+                                Text("\(progress.fileCount) files scanned · \(formattedSize(progress.totalSize))")
+                                    .font(.system(size: 12, weight: .semibold))
+                                    .foregroundStyle(.secondary)
+                            }
+                            
+                            Button(action: viewModel.cancelActiveScan) {
+                                Label("Cancel Scan", systemImage: "xmark.circle")
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.large)
+                            .padding(.top, 12)
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .background(Color(NSColor.underPageBackgroundColor))
+                    } else {
+                        // Completely Centered Welcome selection Hub
+                        VStack {
+                            Spacer()
+                            HStack {
                                 Spacer()
                                 VStack(spacing: 24) {
-                                    VStack(spacing: 6) {
+                                    VStack(spacing: 8) {
                                         Image(systemName: "circle.grid.hex")
-                                            .font(.system(size: 40))
+                                            .font(.system(size: 48))
                                             .foregroundStyle(.blue.gradient)
                                         Text("DiskInventoryY")
-                                            .font(.system(size: 20, weight: .bold))
+                                            .font(.system(size: 24, weight: .bold))
                                         Text("Select a volume or folder to begin scanning")
                                             .font(.subheadline)
                                             .foregroundStyle(.secondary)
@@ -140,9 +198,9 @@ public struct ContentView: View {
                                                 }
                                             }
                                         }
-                                        .frame(height: 140)
+                                        .frame(height: 180)
                                     }
-                                    .frame(width: 420)
+                                    .frame(width: 440)
                                     .padding(12)
                                     .background(Color(NSColor.windowBackgroundColor).opacity(0.5))
                                     .cornerRadius(8)
@@ -159,38 +217,17 @@ public struct ContentView: View {
                                         .controlSize(.regular)
                                     }
                                 }
-                                .padding(24)
+                                .padding(32)
                                 .background(Color(NSColor.windowBackgroundColor))
-                                .cornerRadius(12)
-                                .shadow(color: .black.opacity(0.1), radius: 8, x: 0, y: 4)
+                                .cornerRadius(16)
+                                .shadow(color: .black.opacity(0.12), radius: 16, x: 0, y: 6)
                                 Spacer()
                             }
-                        }
-                    }
-                    .frame(minHeight: 150)
-                    
-                    // Bottom: Treemap View
-                    VStack(alignment: .leading, spacing: 0) {
-                        HStack {
-                            Text("Interactive Treemap Layout (Top Files)")
-                                .font(.system(size: 11, weight: .semibold))
-                                .foregroundStyle(.secondary)
                             Spacer()
-                            if let focused = viewModel.treemapRoot {
-                                Text("Focusing: \(focused.name)")
-                                    .font(.system(size: 10, weight: .medium))
-                                    .foregroundStyle(.blue)
-                            }
                         }
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 6)
-                        .background(Color(NSColor.windowBackgroundColor))
-                        
-                        Divider()
-                        
-                        TreemapView(rootItem: viewModel.treemapRoot, selectedItem: $viewModel.selectedItem)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .background(Color(NSColor.underPageBackgroundColor))
                     }
-                    .frame(minHeight: 150)
                 }
                 .frame(minWidth: 400, maxWidth: .infinity)
                 
