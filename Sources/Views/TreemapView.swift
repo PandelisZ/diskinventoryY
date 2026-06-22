@@ -191,10 +191,12 @@ public struct TreemapView: View {
         
         let maxIndividualFiles = 250 // Render top 250 files as individual detailed tiles
         
-        // 1. Recursively gather all files
+        // 1. Recursively gather all files with size > 0 (0-byte files cannot be drawn in a treemap and cause division-by-zero NaN bugs)
         func traverse(_ node: DiskItem) {
             if node.type == .file {
-                individualFiles.append(node)
+                if node.size > 0 {
+                    individualFiles.append(node)
+                }
             } else if let children = node.children {
                 for child in children {
                     traverse(child)
