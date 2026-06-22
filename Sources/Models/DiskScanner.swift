@@ -345,6 +345,7 @@ public actor DiskScanner {
                             let path = fileURL.standardizedFileURL.path
                             let name = fileURL.lastPathComponent
                             let folderName = fileURL.lastPathComponent
+                            let isAppBundle = fileURL.pathExtension.lowercased() == "app"
                             
                             // Skip the popped dir itself if returned
                             if path == parentPath { continue }
@@ -361,19 +362,37 @@ public actor DiskScanner {
                             
                             if isDir {
                                 // Smart Skip Option:
-                                if skipDependencies && self.skippedFolderNames.contains(folderName) {
-                                    let shallowContents = (try? fm.contentsOfDirectory(at: fileURL, includingPropertiesForKeys: [.fileSizeKey, .isDirectoryKey], options: [.skipsHiddenFiles])) ?? []
-                                    var shallowSize: Int64 = 0
-                                    for itemURL in shallowContents {
-                                        let fileVals = try? itemURL.resourceValues(forKeys: [.fileSizeKey, .isDirectoryKey])
-                                        if fileVals?.isDirectory == false {
-                                            shallowSize += Int64(fileVals?.fileSize ?? 0)
+                                // Skip deep scans inside:
+                                // 1) standard massive developer dependency/cache folders
+                                // 2) macOS application bundles (.app) to match Finder's atomic representation!
+                                if skipDependencies && (self.skippedFolderNames.contains(folderName) || isAppBundle) {
+                                    let calculatedSize: Int64
+                                    let placeholderName: String
+                                    let folderLabel: String
+                                    
+                                    if isAppBundle {
+                                        // For macOS App bundles, calculate total deep size recursively so sizes are 100% accurate!
+                                        calculatedSize = self.calculateDeepDirectorySize(at: fileURL)
+                                        placeholderName = "App bundle contents hidden (Double-click to scan)"
+                                        folderLabel = name // Keep clean (no suffix)
+                                    } else {
+                                        // For standard build dependencies/caches, do a fast single-level shallow pass
+                                        let shallowContents = (try? fm.contentsOfDirectory(at: fileURL, includingPropertiesForKeys: [.fileSizeKey, .isDirectoryKey], options: [.skipsHiddenFiles])) ?? []
+                                        var shallowSize: Int64 = 0
+                                        for itemURL in shallowContents {
+                                            let fileVals = try? itemURL.resourceValues(forKeys: [.fileSizeKey, .isDirectoryKey])
+                                            if fileVals?.isDirectory == false {
+                                                shallowSize += Int64(fileVals?.fileSize ?? 0)
+                                            }
                                         }
+                                        calculatedSize = shallowSize
+                                        placeholderName = "Deep scan skipped (Double-click to scan)"
+                                        folderLabel = name + " (skipped deep scan)"
                                     }
                                     
                                     // Emit folder start and inject a collapsed explanation file inside it
-                                    eventBuffer.append((.directoryStart(path: path, name: name + " (skipped deep scan)", mtime: mtime), itemParentPath))
-                                    eventBuffer.append((.file(path: path + "/_placeholder_", name: "Deep scan skipped (Double-click to scan)", size: shallowSize, mtime: mtime, ext: "skipped"), path))
+                                    eventBuffer.append((.directoryStart(path: path, name: folderLabel, mtime: mtime), itemParentPath))
+                                    eventBuffer.append((.file(path: path + "/_placeholder_", name: placeholderName, size: calculatedSize, mtime: mtime, ext: "skipped"), path))
                                     
                                     enumerator.skipDescendants() // Bypass entering subfolders
                                 }
@@ -454,5 +473,26 @@ public actor DiskScanner {
         }
         
         return index
+    }
+    
+    /// Recursively calculate the absolute deep byte-size of a directory in milliseconds, bypassing node generation
+    nonisolated private func calculateDeepDirectorySize(at url: URL) -> Int64 {
+        let fm = FileManager.default
+        let keys: Set<URLResourceKey> = [.fileSizeKey, .isDirectoryKey]
+        guard let enumerator = fm.enumerator(
+            at: url,
+            includingPropertiesForKeys: Array(keys),
+            options: [.skipsHiddenFiles]
+        ) else {
+            return 0
+        }
+        var total: Int64 = 0
+        while let fileURL = enumerator.nextObject() as? URL {
+            let vals = try? fileURL.resourceValues(forKeys: keys)
+            if vals?.isDirectory == false {
+                total += Int64(vals?.fileSize ?? 0)
+            }
+        }
+        return total
     }
 }
