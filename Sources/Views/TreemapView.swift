@@ -182,13 +182,19 @@ public struct TreemapView: View {
         self._selectedItem = selectedItem
     }
     
-    /// Collect largest leaf files recursively under standard item
+    /// Collect largest files recursively and group any small files by their parent directory.
+    /// This eliminates the massive, anonymous "Other Small Files" box by dividing small files logically
+    /// across the directories they actually reside in, making the treemap beautiful, clean, and highly actionable!
     private func collectFiles(from item: DiskItem) -> [DiskItem] {
-        var files: [DiskItem] = []
+        var individualFiles: [DiskItem] = []
+        var smallFilesByParent: [String: (parent: DiskItem, size: Int64, count: Int)] = [:]
         
+        let maxIndividualFiles = 250 // Render top 250 files as individual detailed tiles
+        
+        // 1. Recursively gather all files
         func traverse(_ node: DiskItem) {
             if node.type == .file {
-                files.append(node)
+                individualFiles.append(node)
             } else if let children = node.children {
                 for child in children {
                     traverse(child)
@@ -197,24 +203,48 @@ public struct TreemapView: View {
         }
         
         traverse(item)
-        files.sort { $0.size > $1.size }
         
-        if files.count > maxNodes {
-            let topFiles = Array(files.prefix(maxNodes - 1))
-            let remainingSize = files.suffix(from: maxNodes - 1).reduce(0) { $0 + $1.size }
-            if remainingSize > 0 {
-                let otherItem = DiskItem(
-                    path: item.path + "/_other_small_files_",
-                    name: "Other Small Files",
-                    type: .file,
-                    size: remainingSize,
-                    fileExtension: "tmp"
-                )
-                return topFiles + [otherItem]
-            }
-            return topFiles
+        // Sort all files descending by size
+        individualFiles.sort { $0.size > $1.size }
+        
+        if individualFiles.count <= maxIndividualFiles {
+            return individualFiles
         }
-        return files
+        
+        // 2. Separate into top individual files and remaining small files
+        let topFiles = Array(individualFiles.prefix(maxIndividualFiles))
+        let remainingFiles = individualFiles.suffix(from: maxIndividualFiles)
+        
+        // 3. Group remaining files by their parent folder path
+        for file in remainingFiles {
+            guard let parent = file.parent else { continue }
+            let parentPath = parent.path
+            
+            let current = smallFilesByParent[parentPath] ?? (parent: parent, size: 0, count: 0)
+            smallFilesByParent[parentPath] = (parent: parent, size: current.size + file.size, count: current.count + 1)
+        }
+        
+        // 4. Create special "Other Files in [Folder]" items for the grouped small files
+        var groupedItems: [DiskItem] = []
+        for (parentPath, stats) in smallFilesByParent {
+            guard stats.size > 0 else { continue }
+            
+            let parentName = stats.parent.name
+            let otherItem = DiskItem(
+                path: parentPath + "/_other_small_files_grouped_",
+                name: "Other files in \(parentName)",
+                type: .file,
+                size: stats.size,
+                fileExtension: "tmp" // Maps to neutral gray or similar
+            )
+            // Crucial: link parent reference so clicking it selects the directory!
+            otherItem.parent = stats.parent
+            groupedItems.append(otherItem)
+        }
+        
+        // 5. Combine and sort descending by size
+        let combined = topFiles + groupedItems
+        return combined.sorted { $0.size > $1.size }
     }
     
     private func formattedSize(_ bytes: Int64) -> String {
