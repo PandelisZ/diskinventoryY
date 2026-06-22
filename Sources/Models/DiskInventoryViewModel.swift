@@ -123,12 +123,12 @@ public final class DiskInventoryViewModel {
                 }
             }
             
-            let root = await scanner.scan(url: url, skipDependencies: skipDependencies) { [weak self] progress, rootItemState in
+            let root = await scanner.scan(url: url, skipDependencies: skipDependencies) { [weak self] progress, _ in
                 Task { @MainActor in
                     guard let self = self, self.currentScanID == scanID else { return }
+                    // ONLY update progress counters to keep the loading card lag-free!
+                    // We do NOT set rootItem here, avoiding heavy SwiftUI list layouts during the scan.
                     self.scanProgress = progress
-                    self.rootItem = rootItemState
-                    self.updateExtensionGroups(for: rootItemState)
                 }
             }
             
@@ -177,8 +177,14 @@ public final class DiskInventoryViewModel {
                 Task { @MainActor in
                     guard let self = self, self.currentScanID == scanID else { return }
                     self.scanProgress = progress
-                    self.rootItem = rootItemState
-                    self.updateExtensionGroups(for: rootItemState)
+                    
+                    // Only update the tree structure live if this is NOT a silent background rescan.
+                    // If it is an auto-background rescan, we keep the cached tree 100% frozen on screen
+                    // to keep scrolling butter-smooth, and only apply the updated tree atomically at the end!
+                    if !isAutoBackgroundRescan {
+                        self.rootItem = rootItemState
+                        self.updateExtensionGroups(for: rootItemState)
+                    }
                 }
             }
             
