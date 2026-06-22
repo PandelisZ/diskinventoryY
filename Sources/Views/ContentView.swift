@@ -94,8 +94,21 @@ public struct ContentView: View {
                                                 .frame(width: 50, height: 6)
                                                 .padding(.leading, 4)
                                         }
+                                        .contentShape(Rectangle())
+                                        .onTapGesture(count: 2) {
+                                            if item.type == .directory {
+                                                viewModel.deepScanFolder(at: item)
+                                            }
+                                        }
                                         .tag(item)
                                         .contextMenu {
+                                            if item.type == .directory {
+                                                Button("Deep Scan Folder") {
+                                                    viewModel.deepScanFolder(at: item)
+                                                }
+                                                Divider()
+                                            }
+                                            
                                             Button("Reveal in Finder") {
                                                 NSWorkspace.shared.selectFile(item.path, inFileViewerRootedAtPath: "")
                                             }

@@ -83,7 +83,7 @@ public final class DiskInventoryViewModel {
     }
     
     /// Starts a fresh scan of the given directory.
-    public func startScan(at url: URL) {
+    public func startScan(at url: URL, skipDependencies: Bool = true) {
         cancelActiveScan()
         
         let scanID = UUID()
@@ -107,7 +107,7 @@ public final class DiskInventoryViewModel {
                 }
             }
             
-            let root = await scanner.scan(url: url) { [weak self] progress, rootItemState in
+            let root = await scanner.scan(url: url, skipDependencies: skipDependencies) { [weak self] progress, rootItemState in
                 Task { @MainActor in
                     guard let self = self, self.currentScanID == scanID else { return }
                     self.scanProgress = progress
@@ -129,7 +129,7 @@ public final class DiskInventoryViewModel {
     }
     
     /// Starts an APFS mtime-optimized incremental rescan of the current directory, if we have a root.
-    public func startIncrementalScan() {
+    public func startIncrementalScan(skipDependencies: Bool = true) {
         guard let url = currentScanURL, let previous = rootItem else { return }
         
         cancelActiveScan()
@@ -152,7 +152,7 @@ public final class DiskInventoryViewModel {
                 }
             }
             
-            let root = await scanner.scan(url: url, previousRoot: previous) { [weak self] progress, rootItemState in
+            let root = await scanner.scan(url: url, previousRoot: previous, skipDependencies: skipDependencies) { [weak self] progress, rootItemState in
                 Task { @MainActor in
                     guard let self = self, self.currentScanID == scanID else { return }
                     self.scanProgress = progress
@@ -171,6 +171,98 @@ public final class DiskInventoryViewModel {
                 }
             }
         }
+    }
+    
+    /// Starts a targeted, in-place deep scan of a specific skipped directory, merging its findings back into our main tree.
+    public func deepScanFolder(at item: DiskItem) {
+        let url = URL(fileURLWithPath: item.path)
+        
+        cancelActiveScan()
+        
+        let scanID = UUID()
+        self.currentScanID = scanID
+        
+        self.isScanning = true
+        self.selectedItem = nil
+        self.scanProgress = nil
+        
+        let scanner = DiskScanner()
+        self.activeScanner = scanner
+        
+        self.scanTask = Task.detached(priority: .userInitiated) { [weak self, scanID] in
+            defer {
+                Task { @MainActor in
+                    guard let self = self, self.currentScanID == scanID else { return }
+                    self.isScanning = false
+                }
+            }
+            
+            // Force skipDependencies = false to perform a targeted full deep scan
+            let subtree = await scanner.scan(url: url, previousRoot: nil, skipDependencies: false) { [weak self] progress, _ in
+                Task { @MainActor in
+                    guard let self = self, self.currentScanID == scanID else { return }
+                    self.scanProgress = progress
+                }
+            }
+            
+            guard !Task.isCancelled else { return }
+            
+            Task { @MainActor in
+                guard let self = self, self.currentScanID == scanID else { return }
+                if let subtree = subtree {
+                    self.mergeDeepSubtree(subtree, atPath: item.path)
+                }
+            }
+        }
+    }
+    
+    /// Merge a newly-deep-scanned subtree into our active root tree in-place, updating size differences up the chain.
+    @MainActor
+    private func mergeDeepSubtree(_ subtree: DiskItem, atPath path: String) {
+        guard let root = rootItem else { return }
+        
+        // Find the node in our active tree
+        guard let oldNode = root.findNode(byPath: path) else { return }
+        
+        let oldSize = oldNode.size
+        let newSize = subtree.size
+        let sizeDiff = newSize - oldSize
+        
+        // Update the old node's children, size, and rename to clean skipped suffix
+        oldNode.children = subtree.children
+        oldNode.size = newSize
+        
+        // Update parent links for the newly appended subtrees
+        if let children = oldNode.children {
+            for child in children {
+                child.parent = oldNode
+            }
+        }
+        
+        // Propagate size difference upwards through parent chains up to root
+        var cursor = oldNode.parent
+        while let p = cursor {
+            p.size += sizeDiff
+            cursor = p.parent
+        }
+        
+        // Re-sort parent directories to reflect the expanded storage weight
+        var sortCursor: DiskItem? = oldNode
+        while let p = sortCursor {
+            p.children?.sort { $0.size > $1.size }
+            sortCursor = p.parent
+        }
+        
+        // Recalculate file extension legend aggregates on the updated tree
+        updateExtensionGroups(for: root)
+        
+        // Update selection to focus on the deep-scanned node
+        self.selectedItem = oldNode
+        
+        // Force state binding refresh in SwiftUI
+        let tempRoot = root
+        self.rootItem = nil
+        self.rootItem = tempRoot
     }
     
     public func cancelActiveScan() {

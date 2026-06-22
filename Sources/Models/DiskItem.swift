@@ -28,6 +28,21 @@ public final class DiskItem: Identifiable, Codable, @unchecked Sendable, Hashabl
         hasher.combine(path)
     }
     
+    /// Prune-pruned recursive absolute path lookup to find any subtree node in O(Depth) time
+    public func findNode(byPath targetPath: String) -> DiskItem? {
+        if self.path == targetPath { return self }
+        if targetPath.hasPrefix(self.path + "/") {
+            if let children = self.children {
+                for child in children {
+                    if let found = child.findNode(byPath: targetPath) {
+                        return found
+                    }
+                }
+            }
+        }
+        return nil
+    }
+    
     // Helper property to calculate percentage of parent size
     public var percentageOfParent: Double {
         guard let parentSize = parent?.size, parentSize > 0 else { return 1.0 }

@@ -51,7 +51,6 @@ final class TreeBuilder {
     }
     
     /// Inserts any scanning event into the tree, matching parents by absolute path.
-    /// This allows multiple concurrent traversal agents on different cores to emit events in any order!
     func process(event: ScanEvent, parentPath: String) {
         // Resolve parent folder
         guard let parentFolder = pathIndex[parentPath] else {
@@ -142,6 +141,24 @@ public actor DiskScanner {
     private var isCancelled = false
     private var pendingContinuations: [CheckedContinuation<URL?, Never>] = []
     
+    // Set of standard massive folders to skip deep recursive scanning by default
+    private let skippedFolderNames: Set<String> = [
+        "node_modules",
+        "venv",
+        ".venv",
+        "env",
+        "__pycache__",
+        ".git",
+        "Pods",
+        "Carthage",
+        "target",
+        ".build",
+        ".swiftpm",
+        "Caches",
+        ".gradle",
+        "bower_components"
+    ]
+    
     public init() {}
     
     public func cancel() {
@@ -214,6 +231,7 @@ public actor DiskScanner {
     public func scan(
         url: URL,
         previousRoot: DiskItem? = nil,
+        skipDependencies: Bool = true,
         progressHandler: @escaping @Sendable (ScanProgress, DiskItem) -> Void
     ) async -> DiskItem? {
         self.isCancelled = false
@@ -316,6 +334,7 @@ public actor DiskScanner {
                             
                             let path = childURL.standardizedFileURL.path
                             let name = childURL.lastPathComponent
+                            let folderName = childURL.lastPathComponent
                             
                             guard let values = try? childURL.resourceValues(forKeys: enumeratorKeys) else {
                                 continue
@@ -325,8 +344,25 @@ public actor DiskScanner {
                             let mtime = values.contentModificationDate ?? Date()
                             
                             if isDir {
+                                // Smart Skip Option:
+                                // If skipDependencies is enabled and the directory matches our skiplist:
+                                if skipDependencies && self.skippedFolderNames.contains(folderName) {
+                                    // Calculate immediate size quickly without descending recursively
+                                    let shallowContents = (try? fm.contentsOfDirectory(at: childURL, includingPropertiesForKeys: [.fileSizeKey, .isDirectoryKey], options: [.skipsHiddenFiles])) ?? []
+                                    var shallowSize: Int64 = 0
+                                    for itemURL in shallowContents {
+                                        let fileVals = try? itemURL.resourceValues(forKeys: [.fileSizeKey, .isDirectoryKey])
+                                        if fileVals?.isDirectory == false {
+                                            shallowSize += Int64(fileVals?.fileSize ?? 0)
+                                        }
+                                    }
+                                    
+                                    // Emit folder start and inject a collapsed explanation file inside it
+                                    eventBuffer.append((.directoryStart(path: path, name: name + " (skipped deep scan)", mtime: mtime), parentPath))
+                                    eventBuffer.append((.file(path: path + "/_placeholder_", name: "Deep scan skipped (Double-click to scan)", size: shallowSize, mtime: mtime, ext: "skipped"), path))
+                                }
                                 // 1. APFS-mtime incremental rescan check
-                                if let cachedNode = savedIndex[path], cachedNode.modificationDate == mtime {
+                                else if let cachedNode = savedIndex[path], cachedNode.modificationDate == mtime {
                                     self.relinkParentRefs(for: cachedNode)
                                     eventBuffer.append((.reuseSubtree(path: path, subtree: cachedNode), parentPath))
                                 } else {
@@ -344,6 +380,7 @@ public actor DiskScanner {
                                             parentPath: parentPath,
                                             savedIndex: savedIndex,
                                             rootDepth: rootDepth,
+                                            skipDependencies: skipDependencies,
                                             eventBuffer: &eventBuffer,
                                             batchLimit: batchLimit,
                                             flushHandler: flushBuffer
@@ -396,6 +433,7 @@ public actor DiskScanner {
         parentPath: String,
         savedIndex: [String: DiskItem],
         rootDepth: Int,
+        skipDependencies: Bool,
         eventBuffer: inout [(ScanEvent, String)],
         batchLimit: Int,
         flushHandler: (String) async -> Void
@@ -406,6 +444,7 @@ public actor DiskScanner {
         
         let path = url.standardizedFileURL.path
         let name = url.lastPathComponent
+        let folderName = url.lastPathComponent
         
         let fm = FileManager.default
         let enumeratorKeys: Set<URLResourceKey> = [.isDirectoryKey, .contentModificationDateKey, .fileSizeKey]
@@ -418,6 +457,22 @@ public actor DiskScanner {
             let size = Int64(values.fileSize ?? 0)
             let ext = url.pathExtension.lowercased()
             eventBuffer.append((.file(path: path, name: name, size: size, mtime: mtime, ext: ext), parentPath))
+            return
+        }
+        
+        // Check Smart Skip for nested sequential files
+        if skipDependencies && self.skippedFolderNames.contains(folderName) {
+            let shallowContents = (try? fm.contentsOfDirectory(at: url, includingPropertiesForKeys: [.fileSizeKey, .isDirectoryKey], options: [.skipsHiddenFiles])) ?? []
+            var shallowSize: Int64 = 0
+            for itemURL in shallowContents {
+                let fileVals = try? itemURL.resourceValues(forKeys: [.fileSizeKey, .isDirectoryKey])
+                if fileVals?.isDirectory == false {
+                    shallowSize += Int64(fileVals?.fileSize ?? 0)
+                }
+            }
+            
+            eventBuffer.append((.directoryStart(path: path, name: name + " (skipped deep scan)", mtime: mtime), parentPath))
+            eventBuffer.append((.file(path: path + "/_placeholder_", name: "Deep scan skipped (Double-click to scan)", size: shallowSize, mtime: mtime, ext: "skipped"), path))
             return
         }
         
@@ -449,6 +504,7 @@ public actor DiskScanner {
                 parentPath: path,
                 savedIndex: savedIndex,
                 rootDepth: rootDepth,
+                skipDependencies: skipDependencies,
                 eventBuffer: &eventBuffer,
                 batchLimit: batchLimit,
                 flushHandler: flushHandler
