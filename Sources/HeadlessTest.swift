@@ -1,7 +1,6 @@
 import Foundation
 
-@Sendable
-func runHeadlessScannerTest() {
+func runHeadlessScannerTest() async {
     print("=========================================================")
     print("      DiskInventoryY - AUTOMATED SCANNER VERIFICATION")
     print("=========================================================")
@@ -41,27 +40,17 @@ func runHeadlessScannerTest() {
         let scanner = DiskScanner()
         let t1Start = DispatchTime.now()
         
-        // We use a semaphore or await directly in Task
-        let group = DispatchGroup()
-        group.enter()
-        
-        var scannedRoot: DiskItem? = nil
-        
-        Task {
-            scannedRoot = await scanner.scan(url: tempDirURL) { progress, _ in
-                // Progress updates ignored for headless test
-            }
-            group.leave()
+        let rootNode = await scanner.scan(url: tempDirURL) { progress, _ in
+            // Progress updates ignored for headless test
         }
-        group.wait()
         
-        let t1End = DispatchTime.now()
-        let t1Elapsed = Double(t1End.uptimeNanoseconds - t1Start.uptimeNanoseconds) / 1_000_000_000.0
-        
-        guard let root = scannedRoot else {
+        guard let root = rootNode else {
             print("❌ ERROR: Fresh scan failed to return root node.")
             exit(1)
         }
+        
+        let t1End = DispatchTime.now()
+        let t1Elapsed = Double(t1End.uptimeNanoseconds - t1Start.uptimeNanoseconds) / 1_000_000_000.0
         
         print("Fresh scan complete in \(String(format: "%.4f", t1Elapsed)) seconds.")
         print("Scanned root size: \(root.size) bytes (expected: 184,320 bytes)")
@@ -96,30 +85,23 @@ func runHeadlessScannerTest() {
         print("\n[5/6] Simulating disk modifications and running APFS-Optimized Incremental Rescan...")
         
         // Wait 1.1s to guarantee mtime timestamp on APFS shifts forward clearly
-        Thread.sleep(forTimeInterval: 1.1)
+        try? await Task.sleep(nanoseconds: 1_100_000_000)
         
         // Modify root_file.txt size from 10 KB to 30 KB (updates root directory mtime, but SubFolder mtime is UNCHANGED)
         try Data(repeating: 69, count: 30 * 1024).write(to: file1URL) // Now 30 KB
         print("Modified 'root_file.txt' size: 10 KB -> 30 KB. Expected new total: 200 KB (204,800 bytes).")
         
         let t2Start = DispatchTime.now()
-        group.enter()
         
-        var rescannedRoot: DiskItem? = nil
-        Task {
-            // Pass loadedRoot as previousRoot to trigger incremental scan speedup
-            rescannedRoot = await scanner.scan(url: tempDirURL, previousRoot: loadedRoot) { progress, _ in }
-            group.leave()
-        }
-        group.wait()
+        let newRootNode = await scanner.scan(url: tempDirURL, previousRoot: loadedRoot) { progress, _ in }
         
-        let t2End = DispatchTime.now()
-        let t2Elapsed = Double(t2End.uptimeNanoseconds - t2Start.uptimeNanoseconds) / 1_000_000_000.0
-        
-        guard let newRoot = rescannedRoot else {
+        guard let newRoot = newRootNode else {
             print("❌ ERROR: Incremental rescan failed to return root node.")
             exit(1)
         }
+        
+        let t2End = DispatchTime.now()
+        let t2Elapsed = Double(t2End.uptimeNanoseconds - t2Start.uptimeNanoseconds) / 1_000_000_000.0
         
         print("Incremental rescan complete in \(String(format: "%.4f", t2Elapsed)) seconds.")
         print("Incremental root size: \(newRoot.size) bytes (expected: 204,800 bytes)")

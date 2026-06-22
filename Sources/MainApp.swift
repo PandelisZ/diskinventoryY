@@ -6,8 +6,11 @@ struct MainApp: App {
         // If run with command-line arguments, handle them and exit
         let args = CommandLine.arguments
         if args.contains("--test-scanner") {
-            runHeadlessScannerTest()
-            exit(0)
+            Task {
+                await runHeadlessScannerTest()
+                exit(0)
+            }
+            dispatchMain()
         }
     }
     
