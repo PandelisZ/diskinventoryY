@@ -45,7 +45,6 @@ final class TreeBuilder {
             lastUIUpdateTime = now
             
             // Decoupled Sort: ONLY sort the directories when we are actually about to publish a progress update to the UI.
-            // This reduces CPU-heavy sorting overhead on the MainActor by over 99%!
             finalizeAndSort()
             
             progressHandler(
@@ -161,7 +160,9 @@ public actor DiskScanner {
         ".swiftpm",
         "Caches",
         ".gradle",
-        "bower_components"
+        "bower_components",
+        "dist",
+        "out"
     ]
     
     public init() {}
@@ -346,6 +347,7 @@ public actor DiskScanner {
                             let name = fileURL.lastPathComponent
                             let folderName = fileURL.lastPathComponent
                             let isAppBundle = fileURL.pathExtension.lowercased() == "app"
+                            let isSkippedFolder = self.skippedFolderNames.contains(folderName) || self.skippedFolderNames.contains(folderName.lowercased())
                             
                             // Skip the popped dir itself if returned
                             if path == parentPath { continue }
@@ -363,32 +365,15 @@ public actor DiskScanner {
                             if isDir {
                                 // Smart Skip Option:
                                 // Skip deep scans inside:
-                                // 1) standard massive developer dependency/cache folders
+                                // 1) standard massive developer dependency/cache folders, git repos, dist, out
                                 // 2) macOS application bundles (.app) to match Finder's atomic representation!
-                                if skipDependencies && (self.skippedFolderNames.contains(folderName) || isAppBundle) {
-                                    let calculatedSize: Int64
-                                    let placeholderName: String
-                                    let folderLabel: String
-                                    
-                                    if isAppBundle {
-                                        // For macOS App bundles, calculate total deep size recursively so sizes are 100% accurate!
-                                        calculatedSize = self.calculateDeepDirectorySize(at: fileURL)
-                                        placeholderName = "App bundle contents hidden (Double-click to scan)"
-                                        folderLabel = name // Keep clean (no suffix)
-                                    } else {
-                                        // For standard build dependencies/caches, do a fast single-level shallow pass
-                                        let shallowContents = (try? fm.contentsOfDirectory(at: fileURL, includingPropertiesForKeys: [.fileSizeKey, .isDirectoryKey], options: [.skipsHiddenFiles])) ?? []
-                                        var shallowSize: Int64 = 0
-                                        for itemURL in shallowContents {
-                                            let fileVals = try? itemURL.resourceValues(forKeys: [.fileSizeKey, .isDirectoryKey])
-                                            if fileVals?.isDirectory == false {
-                                                shallowSize += Int64(fileVals?.fileSize ?? 0)
-                                            }
-                                        }
-                                        calculatedSize = shallowSize
-                                        placeholderName = "Deep scan skipped (Double-click to scan)"
-                                        folderLabel = name + " (skipped deep scan)"
-                                    }
+                                if skipDependencies && (isSkippedFolder || isAppBundle) {
+                                    // Calculate total deep size recursively so sizes are 100% accurate on the disk map!
+                                    let calculatedSize = self.calculateDeepDirectorySize(at: fileURL)
+                                    let placeholderName = isAppBundle 
+                                        ? "App bundle contents hidden (Double-click to scan)" 
+                                        : "Deep scan skipped (Double-click to scan)"
+                                    let folderLabel = name // Keep clean (no suffix)
                                     
                                     // Emit folder start and inject a collapsed explanation file inside it
                                     eventBuffer.append((.directoryStart(path: path, name: folderLabel, mtime: mtime), itemParentPath))
