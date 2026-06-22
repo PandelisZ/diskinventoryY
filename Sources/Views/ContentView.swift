@@ -66,7 +66,7 @@ public struct ContentView: View {
                             // Custom Tree outline list view with programmatic selection expansion and scroll-to-center
                             ScrollViewReader { proxy in
                                 List {
-                                    OutlineRow(item: root, selectedItem: $viewModel.selectedItem, expandedPaths: $expandedPaths) { targetFolder in
+                                    OutlineRow(item: root, viewModel: viewModel, expandedPaths: $expandedPaths) { targetFolder in
                                         viewModel.deepScanFolder(at: targetFolder)
                                     }
                                 }
@@ -329,46 +329,87 @@ public struct ContentView: View {
                     .disabled(viewModel.isScanning)
                 }
             }
-            // Glassmorphic real-time scanning overlay at bottom
+            // Combined bottom bar drawer overlay (progress + space clearing cart)
             .safeAreaInset(edge: .bottom) {
-                if viewModel.isScanning, let progress = viewModel.scanProgress {
-                    VStack(spacing: 8) {
-                        Divider()
-                        HStack(spacing: 12) {
-                            ProgressView()
-                                .controlSize(.small)
-                            
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("Scanning files...")
-                                    .font(.system(size: 11, weight: .bold))
-                                Text(progress.currentItemPath)
-                                    .font(.system(size: 9, design: .monospaced))
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(1)
-                                    .truncationMode(.middle)
-                            }
-                            
-                            Spacer()
-                            
-                            HStack(spacing: 16) {
-                                Text("\(progress.fileCount) files")
-                                    .font(.system(size: 10, weight: .semibold))
-                                    .foregroundStyle(.secondary)
+                VStack(spacing: 0) {
+                    if viewModel.isScanning, let progress = viewModel.scanProgress {
+                        VStack(spacing: 8) {
+                            Divider()
+                            HStack(spacing: 12) {
+                                ProgressView()
+                                    .controlSize(.small)
                                 
-                                Text(formattedSize(progress.totalSize))
-                                    .font(.system(size: 11, weight: .bold, design: .monospaced))
-                                    .foregroundStyle(.blue)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("Scanning files...")
+                                        .font(.system(size: 11, weight: .bold))
+                                    Text(progress.currentItemPath)
+                                        .font(.system(size: 9, design: .monospaced))
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                        .truncationMode(.middle)
+                                }
+                                
+                                Spacer()
+                                
+                                HStack(spacing: 16) {
+                                    Text("\(progress.fileCount) files")
+                                        .font(.system(size: 10, weight: .semibold))
+                                        .foregroundStyle(.secondary)
+                                    
+                                    Text(formattedSize(progress.totalSize))
+                                        .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                        .foregroundStyle(.blue)
+                                }
                             }
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 8)
+                            .background(.ultraThinMaterial)
                         }
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 8)
-                        .background(.ultraThinMaterial)
+                    }
+                    
+                    if !viewModel.markedForDeletion.isEmpty {
+                        VStack(spacing: 0) {
+                            Divider()
+                            HStack(spacing: 16) {
+                                Image(systemName: "trash.fill")
+                                    .font(.system(size: 16))
+                                    .foregroundStyle(.red)
+                                
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("\(viewModel.topLevelMarkedItems.count) items marked for deletion")
+                                        .font(.system(size: 11, weight: .bold))
+                                    Text("Total space to clear: \(formattedSize(viewModel.totalMarkedSize))")
+                                        .font(.system(size: 10))
+                                        .foregroundStyle(.secondary)
+                                }
+                                
+                                Spacer()
+                                
+                                Button("Clear Marks") {
+                                    viewModel.markedForDeletion.removeAll()
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.regular)
+                                
+                                Button(role: .destructive) {
+                                    triggerBulkDelete()
+                                } label: {
+                                    Label("Move to Trash", systemImage: "trash.fill")
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .controlSize(.regular)
+                            }
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 10)
+                            .background(.ultraThinMaterial)
+                        }
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
                     }
                 }
             }
             .sheet(item: $selectedExtensionGroup) { group in
                 let files = collectFiles(withExtension: group.fileExtension, under: viewModel.rootItem)
-                ExtensionFilesView(group: group, files: files) { targetFile in
+                ExtensionFilesView(group: group, files: files, viewModel: viewModel) { targetFile in
                     viewModel.selectedItem = targetFile
                 }
             }
@@ -376,6 +417,23 @@ public struct ContentView: View {
     }
     
     // MARK: - Actions
+    
+    private func triggerBulkDelete() {
+        let alert = NSAlert()
+        alert.messageText = "Move Marked Items to Trash?"
+        alert.informativeText = "Are you sure you want to move these \(viewModel.topLevelMarkedItems.count) marked items (Total size: \(formattedSize(viewModel.totalMarkedSize))) to the Trash?"
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Move to Trash")
+        alert.addButton(withTitle: "Cancel")
+        
+        if alert.runModal() == .alertFirstButtonReturn {
+            do {
+                try viewModel.deleteMarkedItems()
+            } catch {
+                showError(title: "Deletion Failed", message: error.localizedDescription)
+            }
+        }
+    }
     
     private func selectFolderToScan() {
         let panel = NSOpenPanel()
@@ -508,7 +566,7 @@ struct VolumeRow: View {
 
 struct OutlineRow: View {
     let item: DiskItem
-    @Binding var selectedItem: DiskItem?
+    let viewModel: DiskInventoryViewModel
     @Binding var expandedPaths: Set<String>
     let onDeepScan: (DiskItem) -> Void
     
@@ -532,7 +590,7 @@ struct OutlineRow: View {
             ) {
                 if let children = item.children {
                     ForEach(children) { child in
-                        OutlineRow(item: child, selectedItem: $selectedItem, expandedPaths: $expandedPaths, onDeepScan: onDeepScan)
+                        OutlineRow(item: child, viewModel: viewModel, expandedPaths: $expandedPaths, onDeepScan: onDeepScan)
                     }
                 }
             } label: {
@@ -545,6 +603,17 @@ struct OutlineRow: View {
     
     private var rowContent: some View {
         HStack(spacing: 8) {
+            // Checkbox for deletion marking
+            Button {
+                viewModel.toggleDeletionMark(for: item)
+            } label: {
+                Image(systemName: viewModel.isMarkedForDeletion(item) ? "checkmark.square.fill" : "square")
+                    .font(.system(size: 12))
+                    .foregroundStyle(viewModel.isMarkedForDeletion(item) ? .red : .secondary)
+            }
+            .buttonStyle(.plain)
+            .frame(width: 14)
+            
             Image(systemName: item.type == .directory ? "folder.fill" : "doc.fill")
                 .font(.system(size: 12))
                 .foregroundStyle(item.type == .directory ? .blue : .secondary)
@@ -573,7 +642,7 @@ struct OutlineRow: View {
         }
         .contentShape(Rectangle())
         .onTapGesture {
-            selectedItem = item
+            viewModel.selectedItem = item
         }
         .onTapGesture(count: 2) {
             if item.type == .directory {
@@ -597,10 +666,36 @@ struct OutlineRow: View {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(item.path, forType: .string)
             }
+            
+            Divider()
+            
+            // Native confirmation warning before recycling to macOS Trash
+            Button(role: .destructive) {
+                let alert = NSAlert()
+                alert.messageText = "Move to Trash?"
+                alert.informativeText = "Are you sure you want to move '\(item.name)' and all of its contents to the Trash?"
+                alert.alertStyle = .warning
+                alert.addButton(withTitle: "Move to Trash")
+                alert.addButton(withTitle: "Cancel")
+                
+                if alert.runModal() == .alertFirstButtonReturn {
+                    do {
+                        try viewModel.deleteItem(item)
+                    } catch {
+                        let errorAlert = NSAlert()
+                        errorAlert.messageText = "Deletion Failed"
+                        errorAlert.informativeText = error.localizedDescription
+                        errorAlert.runModal()
+                    }
+                }
+            } label: {
+                Label("Move to Trash", systemImage: "trash.fill")
+                    .foregroundStyle(.red)
+            }
         }
         .padding(.vertical, 4)
         .padding(.horizontal, 6)
-        .background(selectedItem?.path == item.path ? Color(NSColor.selectedControlColor).opacity(0.18) : Color.clear)
+        .background(viewModel.selectedItem?.path == item.path ? Color(NSColor.selectedControlColor).opacity(0.18) : Color.clear)
         .cornerRadius(4)
     }
 }
@@ -608,24 +703,30 @@ struct OutlineRow: View {
 struct ExtensionFilesView: View {
     let group: FileExtensionGroup
     let files: [DiskItem]
+    let viewModel: DiskInventoryViewModel
     let onLocate: (DiskItem) -> Void
     @Environment(\.dismiss) private var dismiss
     
     @State private var searchText = ""
+    @State private var deletedPaths: Set<String> = []
     
     private func formattedSize(_ bytes: Int64) -> String {
         ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
     }
     
     var filteredFiles: [DiskItem] {
+        let activeFiles = files.filter { !deletedPaths.contains($0.path) }
         if searchText.isEmpty {
-            return files
+            return activeFiles
         } else {
-            return files.filter { $0.name.localizedCaseInsensitiveContains(searchText) || $0.path.localizedCaseInsensitiveContains(searchText) }
+            return activeFiles.filter { $0.name.localizedCaseInsensitiveContains(searchText) || $0.path.localizedCaseInsensitiveContains(searchText) }
         }
     }
     
     var body: some View {
+        let active = filteredFiles
+        let totalBytes = active.reduce(0) { $0 + $1.size }
+        
         VStack(alignment: .leading, spacing: 0) {
             // Header
             HStack(spacing: 12) {
@@ -638,7 +739,7 @@ struct ExtensionFilesView: View {
                 
                 Spacer()
                 
-                Text("\(group.fileCount) files · \(formattedSize(group.totalSize))")
+                Text("\(active.count) files · \(formattedSize(totalBytes))")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
             }
@@ -710,6 +811,33 @@ struct ExtensionFilesView: View {
                         Button("Copy Path") {
                             NSPasteboard.general.clearContents()
                             NSPasteboard.general.setString(file.path, forType: .string)
+                        }
+                        
+                        Divider()
+                        
+                        // Right-click delete from subview
+                        Button(role: .destructive) {
+                            let alert = NSAlert()
+                            alert.messageText = "Move to Trash?"
+                            alert.informativeText = "Are you sure you want to move '\(file.name)' to the Trash?"
+                            alert.alertStyle = .warning
+                            alert.addButton(withTitle: "Move to Trash")
+                            alert.addButton(withTitle: "Cancel")
+                            
+                            if alert.runModal() == .alertFirstButtonReturn {
+                                do {
+                                    try viewModel.deleteItem(file)
+                                    deletedPaths.insert(file.path)
+                                } catch {
+                                    let errorAlert = NSAlert()
+                                    errorAlert.messageText = "Deletion Failed"
+                                    errorAlert.informativeText = error.localizedDescription
+                                    errorAlert.runModal()
+                                }
+                            }
+                        } label: {
+                            Label("Move to Trash", systemImage: "trash.fill")
+                                .foregroundStyle(.red)
                         }
                     }
                     .padding(.vertical, 2)

@@ -32,6 +32,9 @@ public final class DiskInventoryViewModel {
     // UI aggregates
     public var extensionGroups: [FileExtensionGroup] = []
     
+    // Deletion Queue
+    public var markedForDeletion: Set<String> = []
+    
     private var activeScanner: DiskScanner? = nil
     private var scanTask: Task<Void, Never>? = nil
     private var currentScanID: UUID? = nil
@@ -379,6 +382,159 @@ public final class DiskInventoryViewModel {
         } else {
             // It's a file, show its parent folder in the treemap so we can see the file's context
             return selected.parent ?? rootItem
+        }
+    }
+    
+    // MARK: - Space Clearing & Deletion Operations
+    
+    public func isMarkedForDeletion(_ item: DiskItem) -> Bool {
+        return markedForDeletion.contains(item.path)
+    }
+    
+    /// Recursively marks or unmarks an item and all of its descendants for bulk deletion
+    public func toggleDeletionMark(for item: DiskItem) {
+        let isMarked = markedForDeletion.contains(item.path)
+        
+        func toggleRecursive(_ node: DiskItem, mark: Bool) {
+            if mark {
+                markedForDeletion.insert(node.path)
+            } else {
+                markedForDeletion.remove(node.path)
+            }
+            if let children = node.children {
+                for child in children {
+                    toggleRecursive(child, mark: mark)
+                }
+            }
+        }
+        
+        toggleRecursive(item, mark: !isMarked)
+    }
+    
+    /// Resolves and returns only the top-level directories and files that have been marked,
+    /// completely bypassing redundant child nodes to prevent double-counting.
+    public var topLevelMarkedItems: [DiskItem] {
+        guard let root = rootItem else { return [] }
+        var results: [DiskItem] = []
+        
+        func findTopMarked(_ node: DiskItem) {
+            if markedForDeletion.contains(node.path) {
+                results.append(node)
+            } else if let children = node.children {
+                for child in children {
+                    findTopMarked(child)
+                }
+            }
+        }
+        
+        findTopMarked(root)
+        return results
+    }
+    
+    public var totalMarkedSize: Int64 {
+        return topLevelMarkedItems.reduce(0) { $0 + $1.size }
+    }
+    
+    /// Delete a single item (move to Trash) and update the in-memory tree in-place
+    @MainActor
+    public func deleteItem(_ item: DiskItem) throws {
+        let fm = FileManager.default
+        let itemURL = URL(fileURLWithPath: item.path)
+        
+        // Move to Trash natively (recycles the item)
+        try fm.trashItem(at: itemURL, resultingItemURL: nil)
+        
+        // Subtract size up the parent chain
+        let deletedSize = item.size
+        var cursor = item.parent
+        while let p = cursor {
+            p.size = max(0, p.size - deletedSize)
+            cursor = p.parent
+        }
+        
+        // Remove item from its parent's children array
+        if let parent = item.parent {
+            parent.children?.removeAll { $0.path == item.path }
+            parent.children?.sort { $0.size > $1.size }
+        }
+        
+        // Clear from selection and deletion register
+        if selectedItem?.path == item.path {
+            selectedItem = nil
+        }
+        markedForDeletion.remove(item.path)
+        
+        // Refresh aggregates
+        if let root = rootItem {
+            updateExtensionGroups(for: root)
+            
+            // Force state binding refresh
+            let tempRoot = root
+            self.rootItem = nil
+            self.rootItem = tempRoot
+            
+            // Auto-save updated tree state
+            if let currentURL = currentScanURL {
+                autoSaveCache(for: currentURL, root: tempRoot)
+            }
+        }
+    }
+    
+    /// Delete all checked items in bulk (move to Trash) and update the tree in-place
+    @MainActor
+    public func deleteMarkedItems() throws {
+        let itemsToDelete = topLevelMarkedItems
+        guard !itemsToDelete.isEmpty else { return }
+        
+        let fm = FileManager.default
+        var lastError: Error? = nil
+        
+        for item in itemsToDelete {
+            let itemURL = URL(fileURLWithPath: item.path)
+            do {
+                try fm.trashItem(at: itemURL, resultingItemURL: nil)
+                
+                // Subtract size up parent chain
+                let deletedSize = item.size
+                var cursor = item.parent
+                while let p = cursor {
+                    p.size = max(0, p.size - deletedSize)
+                    cursor = p.parent
+                }
+                
+                // Remove from parent children list
+                if let parent = item.parent {
+                    parent.children?.removeAll { $0.path == item.path }
+                    parent.children?.sort { $0.size > $1.size }
+                }
+                
+                markedForDeletion.remove(item.path)
+            } catch {
+                print("Failed to recycle \(item.path): \(error.localizedDescription)")
+                lastError = error
+            }
+        }
+        
+        // Clear selections
+        selectedItem = nil
+        markedForDeletion.removeAll()
+        
+        // Refresh aggregates
+        if let root = rootItem {
+            updateExtensionGroups(for: root)
+            
+            // Force state binding refresh
+            let tempRoot = root
+            self.rootItem = nil
+            self.rootItem = tempRoot
+            
+            if let currentURL = currentScanURL {
+                autoSaveCache(for: currentURL, root: tempRoot)
+            }
+        }
+        
+        if let error = lastError {
+            throw error
         }
     }
 }
