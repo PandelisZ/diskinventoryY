@@ -378,6 +378,11 @@ public struct ContentView: View {
                     }
                 }
             }
+            .onAppear {
+                // Start a high-speed parallelised scan on the user's home folder on startup first!
+                let homeURL = FileManager.default.homeDirectoryForCurrentUser
+                viewModel.startScan(at: homeURL)
+            }
         }
     }
     

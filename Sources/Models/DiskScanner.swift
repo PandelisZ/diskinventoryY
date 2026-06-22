@@ -7,16 +7,14 @@ public struct ScanProgress: Sendable {
     public let isCompleted: Bool
 }
 
-/// Lightweight events emitted by the background scanner to build the tree on the main thread
+/// Lightweight events emitted by the parallel background scanners
 public enum ScanEvent: Sendable {
     case directoryStart(path: String, name: String, mtime: Date)
     case file(path: String, name: String, size: Int64, mtime: Date, ext: String)
-    case directoryEnd(path: String)
     case reuseSubtree(path: String, subtree: DiskItem)
 }
 
-/// Clean parser that builds the tree and dispatches updates exclusively on the MainActor.
-/// This is a final class to allow thread-safe reference-type capturing in concurrent tasks.
+/// Thread-safe, reference-type parser that builds the tree and dispatches updates exclusively on the MainActor.
 @MainActor
 final class TreeBuilder {
     var currentActiveDirectory: DiskItem
@@ -27,6 +25,9 @@ final class TreeBuilder {
     var totalSize: Int64 = 0
     var totalFileCount = 0
     
+    // Quick cache for O(1) folder parent resolution
+    private var pathIndex: [String: DiskItem] = [:]
+    
     private var lastUIUpdateTime = DispatchTime.now()
     private let uiUpdateIntervalNanoseconds: UInt64 = 100_000_000 // 100ms
     
@@ -35,6 +36,7 @@ final class TreeBuilder {
         self.rootItem = rootItem
         self.rootPath = rootPath
         self.progressHandler = progressHandler
+        self.pathIndex[rootPath] = rootItem
     }
     
     func sendProgress(currentPath: String, force: Bool, completed: Bool) {
@@ -48,68 +50,79 @@ final class TreeBuilder {
         }
     }
     
-    /// Resolve active directories on the fly during depth-first enumeration.
-    /// Closes and sorts subdirectories as we step back up the parent chain.
-    func resolveActiveDirectory(itemPath: String) {
-        while currentActiveDirectory.path != rootPath && !itemPath.hasPrefix(currentActiveDirectory.path + "/") {
-            currentActiveDirectory.children?.sort { $0.size > $1.size }
-            if let parent = currentActiveDirectory.parent {
-                currentActiveDirectory = parent
-            } else {
-                break
-            }
+    /// Inserts any scanning event into the tree, matching parents by absolute path.
+    /// This allows multiple concurrent traversal agents on different cores to emit events in any order!
+    func process(event: ScanEvent, parentPath: String) {
+        // Resolve parent folder
+        guard let parentFolder = pathIndex[parentPath] else {
+            // Fallback to root if parent is missing
+            linkItemToFolder(event: event, parent: rootItem)
+            return
         }
+        linkItemToFolder(event: event, parent: parentFolder)
     }
     
-    func process(event: ScanEvent) {
+    private func linkItemToFolder(event: ScanEvent, parent: DiskItem) {
         switch event {
         case .directoryStart(let path, let name, let mtime):
-            resolveActiveDirectory(itemPath: path)
+            if pathIndex[path] != nil { return } // Already processed
+            
             let newFolder = DiskItem(path: path, name: name, type: .directory, size: 0, modificationDate: mtime, children: [])
-            newFolder.parent = currentActiveDirectory
-            currentActiveDirectory.children = (currentActiveDirectory.children ?? []) + [newFolder]
-            currentActiveDirectory = newFolder
+            newFolder.parent = parent
+            parent.children = (parent.children ?? []) + [newFolder]
+            pathIndex[path] = newFolder
             
         case .file(let path, let name, let size, let mtime, let ext):
-            resolveActiveDirectory(itemPath: path)
             let newFile = DiskItem(path: path, name: name, type: .file, size: size, modificationDate: mtime, fileExtension: ext)
-            newFile.parent = currentActiveDirectory
-            currentActiveDirectory.children = (currentActiveDirectory.children ?? []) + [newFile]
+            newFile.parent = parent
+            parent.children = (parent.children ?? []) + [newFile]
             
-            // Propagate file size upwards through the parent chain
+            // Propagate size upwards through parent chain
             totalSize += size
             totalFileCount += 1
-            var parentCursor: DiskItem? = currentActiveDirectory
-            while let p = parentCursor {
+            var cursor: DiskItem? = parent
+            while let p = cursor {
                 p.size += size
-                parentCursor = p.parent
+                cursor = p.parent
             }
             
-        case .directoryEnd(_):
-            break
+        case .reuseSubtree(_, let cachedSubtree):
+            cachedSubtree.parent = parent
+            parent.children = (parent.children ?? []) + [cachedSubtree]
             
-        case .reuseSubtree(let path, let cachedSubtree):
-            resolveActiveDirectory(itemPath: path)
-            // Link cached subtree under current directory
-            cachedSubtree.parent = currentActiveDirectory
-            currentActiveDirectory.children = (currentActiveDirectory.children ?? []) + [cachedSubtree]
+            // Index the entire cached subtree so any future deep additions find parent folders
+            indexSubtreeRecursively(cachedSubtree)
             
-            // Recalculate and propagate the cached subtree's size and file counts
+            // Recalculate sizes
             let subtreeSize = cachedSubtree.size
             let subtreeFileCount = countFiles(in: cachedSubtree)
             
             totalSize += subtreeSize
             totalFileCount += subtreeFileCount
             
-            var parentCursor: DiskItem? = currentActiveDirectory
-            while let p = parentCursor {
+            var cursor: DiskItem? = parent
+            while let p = cursor {
                 p.size += subtreeSize
-                parentCursor = p.parent
+                cursor = p.parent
             }
         }
     }
     
-    /// Helper to count files in a subtree for progress reports
+    private func indexSubtreeRecursively(_ item: DiskItem) {
+        pathIndex[item.path] = item
+        if let children = item.children {
+            for child in children {
+                indexSubtreeRecursively(child)
+            }
+        }
+    }
+    
+    func finalizeAndSort() {
+        for (_, item) in pathIndex {
+            item.children?.sort { $0.size > $1.size }
+        }
+    }
+    
     private func countFiles(in item: DiskItem) -> Int {
         if item.type == .file { return 1 }
         var count = 0
@@ -123,29 +136,90 @@ final class TreeBuilder {
 }
 
 public actor DiskScanner {
+    // Work queue and worker tracking
+    private var queue: [URL] = []
+    private var activeWorkersCount = 0
     private var isCancelled = false
+    private var pendingContinuations: [CheckedContinuation<URL?, Never>] = []
     
     public init() {}
     
     public func cancel() {
         isCancelled = true
+        for cont in pendingContinuations {
+            cont.resume(returning: nil)
+        }
+        pendingContinuations.removeAll()
     }
     
     private func checkCancelled() -> Bool {
         return isCancelled
     }
     
-    /// Scan a directory, streaming events to build the tree in real-time on the main thread.
-    /// - Parameters:
-    ///   - url: Root URL to scan
-    ///   - previousRoot: The previous scan results of the exact same path, if any, to use for incremental speedup.
-    ///   - progressHandler: A callback triggered periodically on the Main thread with the live progress and root tree state.
+    /// Push a list of subdirectory URLs onto the parallel work queue
+    public func pushWork(_ urls: [URL]) {
+        if isCancelled { return }
+        
+        for url in urls {
+            if !pendingContinuations.isEmpty {
+                let cont = pendingContinuations.removeFirst()
+                cont.resume(returning: url)
+            } else {
+                queue.append(url)
+            }
+        }
+    }
+    
+    /// Pop a directory URL to scan. Suspends if queue is empty but other workers are active.
+    /// Returns nil if the scan is completely finished or cancelled.
+    public func popWork() async -> URL? {
+        if isCancelled { return nil }
+        
+        if !queue.isEmpty {
+            activeWorkersCount += 1
+            return queue.removeFirst()
+        }
+        
+        if activeWorkersCount == 0 {
+            // All workers are idle and queue is empty, scan completed!
+            for cont in pendingContinuations {
+                cont.resume(returning: nil)
+            }
+            pendingContinuations.removeAll()
+            return nil
+        }
+        
+        // Wait for work
+        return await withCheckedContinuation { cont in
+            if isCancelled {
+                cont.resume(returning: nil)
+            } else {
+                pendingContinuations.append(cont)
+            }
+        }
+    }
+    
+    /// Report that a worker has finished scanning its popped directory
+    public func workerFinished() {
+        activeWorkersCount = max(0, activeWorkersCount - 1)
+        if activeWorkersCount == 0 && queue.isEmpty {
+            for cont in pendingContinuations {
+                cont.resume(returning: nil)
+            }
+            pendingContinuations.removeAll()
+        }
+    }
+    
+    /// Parallelised Scan using 1 worker Task per CPU core
     public func scan(
         url: URL,
         previousRoot: DiskItem? = nil,
         progressHandler: @escaping @Sendable (ScanProgress, DiskItem) -> Void
     ) async -> DiskItem? {
         self.isCancelled = false
+        self.queue.removeAll()
+        self.activeWorkersCount = 0
+        self.pendingContinuations.removeAll()
         
         let resolvedURL = URL(fileURLWithPath: url.path)
         let rootPath = resolvedURL.path
@@ -178,109 +252,208 @@ public actor DiskScanner {
         // Build path index for cached incremental rescan matching
         let savedIndex = buildPathIndex(for: previousRoot)
         
-        // Create our stateful MainActor TreeBuilder parser reference
+        // Initialize the tree-building parser state on the MainActor
         let builder = await MainActor.run {
             TreeBuilder(rootItem: rootItem, rootPath: rootPath, progressHandler: progressHandler)
         }
         
-        // Run the fast sequential directory enumerator on a background thread
-        // Emits events in chunks to minimize main-thread actor hop overhead
-        await Task.detached(priority: .userInitiated) {
-            let fm = FileManager.default
-            let enumeratorKeys: Set<URLResourceKey> = [.isDirectoryKey, .contentModificationDateKey, .fileSizeKey]
-            
-            guard let enumerator = fm.enumerator(
-                at: resolvedURL,
-                includingPropertiesForKeys: Array(enumeratorKeys),
-                options: [.skipsHiddenFiles]
-            ) else {
-                return
-            }
-            
-            var eventBuffer: [ScanEvent] = []
-            let bufferSize = 80 // Batch events to maximize throughput
-            
-            // Helper to dispatch buffered events to the MainActor
-            let flushEvents = { (currentPath: String, force: Bool) async in
-                if eventBuffer.isEmpty { return }
-                let batch = eventBuffer
-                eventBuffer.removeAll()
-                
-                await MainActor.run {
-                    for ev in batch {
-                        builder.process(event: ev)
-                    }
-                    builder.sendProgress(currentPath: currentPath, force: force, completed: false)
-                }
-            }
-            
-            var fileCheckCount = 0
-            while let fileURL = enumerator.nextObject() as? URL {
-                if Task.isCancelled { break }
-                
-                // Only check actor-isolated cancellation once every 100 files to avoid actor-hop overhead
-                fileCheckCount += 1
-                if fileCheckCount % 100 == 0 {
-                    let cancelled = await self.checkCancelled()
-                    if cancelled { break }
-                }
-                
-                let path = fileURL.standardizedFileURL.path
-                let name = fileURL.lastPathComponent
-                
-                // Skip the root folder itself if the enumerator returns it
-                if path == rootPath { continue }
-                
-                guard let values = try? fileURL.resourceValues(forKeys: enumeratorKeys) else {
-                    continue
-                }
-                
-                let isDir = values.isDirectory ?? false
-                let mtime = values.contentModificationDate ?? Date()
-                
-                if isDir {
-                    // Check if we can perform an APFS-mtime incremental reuse of this subdirectory
-                    if let cachedNode = savedIndex[path], cachedNode.modificationDate == mtime {
-                        // Re-link parent references inside the cached node
-                        self.relinkParentRefs(for: cachedNode)
-                        
-                        eventBuffer.append(.reuseSubtree(path: path, subtree: cachedNode))
-                        enumerator.skipDescendants() // Tell macOS not to scan inside this directory!
-                    } else {
-                        // Enter the directory
-                        eventBuffer.append(.directoryStart(path: path, name: name, mtime: mtime))
-                    }
-                } else {
-                    let size = Int64(values.fileSize ?? 0)
-                    let ext = fileURL.pathExtension.lowercased()
-                    eventBuffer.append(.file(path: path, name: name, size: size, mtime: mtime, ext: ext))
-                }
-                
-                if eventBuffer.count >= bufferSize {
-                    await flushEvents(path, false)
-                }
-            }
-            
-            // Flush remaining events
-            await flushEvents(rootPath, true)
-            
-            // Clean up depth in our MainActor builder to ensure all folders are properly sorted
-            await MainActor.run {
-                var cursor: DiskItem? = builder.currentActiveDirectory
-                while let p = cursor {
-                    p.children?.sort { $0.size > $1.size }
-                    cursor = p.parent
-                }
-            }
-        }.value
+        // Seed the work queue with the root directory
+        self.queue.append(resolvedURL)
         
-        // Sort final root children and trigger final completed layout
+        // Determine physical CPU core counts to scale traversal agents
+        let coreCount = ProcessInfo.processInfo.activeProcessorCount
+        let rootDepth = resolvedURL.pathComponents.count
+        
+        print("=== Launching Parallel Scanners: Core Count: \(coreCount) ===")
+        
+        // Spawn precisely 1 worker per CPU core to run work-stealing directory crawls
+        await withTaskGroup(of: Void.self) { group in
+            for _ in 0..<coreCount {
+                group.addTask { [weak self] in
+                    guard let self = self else { return }
+                    
+                    let fm = FileManager.default
+                    let enumeratorKeys: Set<URLResourceKey> = [.isDirectoryKey, .contentModificationDateKey, .fileSizeKey]
+                    
+                    // Buffer to batch MainActor hop dispatches
+                    var eventBuffer: [(ScanEvent, String)] = []
+                    let batchLimit = 60
+                    
+                    let flushBuffer = { (currentPath: String) async in
+                        if eventBuffer.isEmpty { return }
+                        let batch = eventBuffer
+                        eventBuffer.removeAll()
+                        
+                        await MainActor.run {
+                            for (ev, parentPath) in batch {
+                                builder.process(event: ev, parentPath: parentPath)
+                            }
+                            builder.sendProgress(currentPath: currentPath, force: false, completed: false)
+                        }
+                    }
+                    
+                    // Worker loop
+                    while let dirURL = await self.popWork() {
+                        if await self.checkCancelled() { break }
+                        
+                        let parentPath = dirURL.standardizedFileURL.path
+                        
+                        // List immediate contents of this popped directory (extremely fast, non-recursive)
+                        guard let contents = try? fm.contentsOfDirectory(
+                            at: dirURL,
+                            includingPropertiesForKeys: Array(enumeratorKeys),
+                            options: [.skipsHiddenFiles]
+                        ) else {
+                            // If unreadable, complete and pop next
+                            await self.workerFinished()
+                            continue
+                        }
+                        
+                        var foldersToQueue: [URL] = []
+                        
+                        for childURL in contents {
+                            if await self.checkCancelled() { break }
+                            
+                            let path = childURL.standardizedFileURL.path
+                            let name = childURL.lastPathComponent
+                            
+                            guard let values = try? childURL.resourceValues(forKeys: enumeratorKeys) else {
+                                continue
+                            }
+                            
+                            let isDir = values.isDirectory ?? false
+                            let mtime = values.contentModificationDate ?? Date()
+                            
+                            if isDir {
+                                // 1. APFS-mtime incremental rescan check
+                                if let cachedNode = savedIndex[path], cachedNode.modificationDate == mtime {
+                                    self.relinkParentRefs(for: cachedNode)
+                                    eventBuffer.append((.reuseSubtree(path: path, subtree: cachedNode), parentPath))
+                                } else {
+                                    // 2. Hybrid Load Balancing:
+                                    // If depth is shallow (<= 3 levels from root), push onto the centralized queue
+                                    // so other idle CPU cores can steal it. Otherwise, scan recursively right now!
+                                    let depth = childURL.pathComponents.count - rootDepth
+                                    if depth <= 3 {
+                                        eventBuffer.append((.directoryStart(path: path, name: name, mtime: mtime), parentPath))
+                                        foldersToQueue.append(childURL)
+                                    } else {
+                                        // Scan sequentially on this worker thread to keep queueing overhead minimal
+                                        await self.scanSequentially(
+                                            url: childURL,
+                                            parentPath: parentPath,
+                                            savedIndex: savedIndex,
+                                            rootDepth: rootDepth,
+                                            eventBuffer: &eventBuffer,
+                                            batchLimit: batchLimit,
+                                            flushHandler: flushBuffer
+                                        )
+                                    }
+                                }
+                            } else {
+                                let size = Int64(values.fileSize ?? 0)
+                                let ext = childURL.pathExtension.lowercased()
+                                eventBuffer.append((.file(path: path, name: name, size: size, mtime: mtime, ext: ext), parentPath))
+                            }
+                            
+                            if eventBuffer.count >= batchLimit {
+                                await flushBuffer(path)
+                            }
+                        }
+                        
+                        // Push directories to queue
+                        if !eventBuffer.isEmpty {
+                            await flushBuffer(parentPath)
+                        }
+                        
+                        if !foldersToQueue.isEmpty {
+                            // Push folders onto the shared work queue so other cores can scan them
+                            await self.pushWork(foldersToQueue)
+                        }
+                        
+                        // Notify coordinator that we finished scanning this specific directory
+                        await self.workerFinished()
+                    }
+                    
+                    // Final flush
+                    await flushBuffer(rootPath)
+                }
+            }
+        }
+        
+        // Finalize sorting and notify final layout
         await MainActor.run {
-            rootItem.children?.sort { $0.size > $1.size }
+            builder.finalizeAndSort()
             builder.sendProgress(currentPath: rootPath, force: true, completed: true)
         }
         
         return rootItem
+    }
+    
+    /// Recursively scan a deep subdirectory sequentially on a single thread to avoid queue contention
+    private func scanSequentially(
+        url: URL,
+        parentPath: String,
+        savedIndex: [String: DiskItem],
+        rootDepth: Int,
+        eventBuffer: inout [(ScanEvent, String)],
+        batchLimit: Int,
+        flushHandler: (String) async -> Void
+    ) async {
+        if Task.isCancelled { return }
+        let cancelled = self.checkCancelled()
+        if cancelled { return }
+        
+        let path = url.standardizedFileURL.path
+        let name = url.lastPathComponent
+        
+        let fm = FileManager.default
+        let enumeratorKeys: Set<URLResourceKey> = [.isDirectoryKey, .contentModificationDateKey, .fileSizeKey]
+        
+        guard let values = try? url.resourceValues(forKeys: enumeratorKeys) else { return }
+        let isDir = values.isDirectory ?? false
+        let mtime = values.contentModificationDate ?? Date()
+        
+        if !isDir {
+            let size = Int64(values.fileSize ?? 0)
+            let ext = url.pathExtension.lowercased()
+            eventBuffer.append((.file(path: path, name: name, size: size, mtime: mtime, ext: ext), parentPath))
+            return
+        }
+        
+        // Check mtime match
+        if let cachedNode = savedIndex[path], cachedNode.modificationDate == mtime {
+            relinkParentRefs(for: cachedNode)
+            eventBuffer.append((.reuseSubtree(path: path, subtree: cachedNode), parentPath))
+            return
+        }
+        
+        // Enter directory
+        eventBuffer.append((.directoryStart(path: path, name: name, mtime: mtime), parentPath))
+        
+        guard let contents = try? fm.contentsOfDirectory(
+            at: url,
+            includingPropertiesForKeys: Array(enumeratorKeys),
+            options: [.skipsHiddenFiles]
+        ) else {
+            return
+        }
+        
+        for childURL in contents {
+            if eventBuffer.count >= batchLimit {
+                await flushHandler(childURL.path)
+            }
+            
+            await scanSequentially(
+                url: childURL,
+                parentPath: path,
+                savedIndex: savedIndex,
+                rootDepth: rootDepth,
+                eventBuffer: &eventBuffer,
+                batchLimit: batchLimit,
+                flushHandler: flushHandler
+            )
+        }
     }
     
     /// Re-links parent references in a reused cached subtree
