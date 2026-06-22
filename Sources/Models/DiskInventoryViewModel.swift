@@ -127,19 +127,17 @@ public final class DiskInventoryViewModel {
                 Task { @MainActor in
                     guard let self = self, self.currentScanID == scanID else { return }
                     // ONLY update progress counters to keep the loading card lag-free!
-                    // We do NOT set rootItem here, avoiding heavy SwiftUI list layouts during the scan.
                     self.scanProgress = progress
                 }
             }
             
-            guard !Task.isCancelled else { return }
-            
+            // On completion OR cancellation, commit the partially or fully scanned tree!
             Task { @MainActor in
-                guard let self = self, self.currentScanID == scanID else { return }
+                guard let self = self, self.currentScanURL == url else { return }
                 if let root = root {
                     self.rootItem = root
                     self.updateExtensionGroups(for: root)
-                    self.autoSaveCache(for: url, root: root) // Auto-save completed fresh scan
+                    self.autoSaveCache(for: url, root: root) // Auto-save the partial or completed snapshot
                 }
             }
         }
@@ -179,8 +177,6 @@ public final class DiskInventoryViewModel {
                     self.scanProgress = progress
                     
                     // Only update the tree structure live if this is NOT a silent background rescan.
-                    // If it is an auto-background rescan, we keep the cached tree 100% frozen on screen
-                    // to keep scrolling butter-smooth, and only apply the updated tree atomically at the end!
                     if !isAutoBackgroundRescan {
                         self.rootItem = rootItemState
                         self.updateExtensionGroups(for: rootItemState)
@@ -188,10 +184,9 @@ public final class DiskInventoryViewModel {
                 }
             }
             
-            guard !Task.isCancelled else { return }
-            
+            // On completion or cancellation, commit and cache the updated tree!
             Task { @MainActor in
-                guard let self = self, self.currentScanID == scanID else { return }
+                guard let self = self, self.currentScanURL == url else { return }
                 if let root = root {
                     self.rootItem = root
                     self.updateExtensionGroups(for: root)
@@ -301,8 +296,6 @@ public final class DiskInventoryViewModel {
     public func cancelActiveScan() {
         self.currentScanID = nil
         self.isScanning = false
-        self.rootItem = nil
-        self.extensionGroups = []
         
         scanTask?.cancel()
         scanTask = nil
