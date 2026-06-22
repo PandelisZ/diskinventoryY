@@ -122,18 +122,22 @@ public final class TreemapLayout {
             
             let itemRect: CGRect
             if isHorizontal {
-                itemRect = CGRect(
-                    x: Double(rect.origin.x) + offset,
-                    y: Double(rect.origin.y),
-                    width: itemLength,
-                    height: thickness
-                )
-            } else {
+                // Layout as a vertical column on the left of the bounding box.
+                // Items stack vertically (along the y-axis).
                 itemRect = CGRect(
                     x: Double(rect.origin.x),
                     y: Double(rect.origin.y) + offset,
                     width: thickness,
                     height: itemLength
+                )
+            } else {
+                // Layout as a horizontal row at the top of the bounding box.
+                // Items stack horizontally (along the x-axis).
+                itemRect = CGRect(
+                    x: Double(rect.origin.x) + offset,
+                    y: Double(rect.origin.y),
+                    width: itemLength,
+                    height: thickness
                 )
             }
             
@@ -145,18 +149,20 @@ public final class TreemapLayout {
         }
         
         if isHorizontal {
+            // Cut off the vertical column from the left side of the remaining area.
             return CGRect(
-                x: Double(rect.origin.x) + offset,
+                x: Double(rect.origin.x) + thickness,
                 y: Double(rect.origin.y),
-                width: max(0, Double(rect.width) - offset),
+                width: max(0, Double(rect.width) - thickness),
                 height: Double(rect.height)
             )
         } else {
+            // Cut off the horizontal row from the top of the remaining area.
             return CGRect(
                 x: Double(rect.origin.x),
-                y: Double(rect.origin.y) + offset,
+                y: Double(rect.origin.y) + thickness,
                 width: Double(rect.width),
-                height: max(0, Double(rect.height) - offset)
+                height: max(0, Double(rect.height) - thickness)
             )
         }
     }
