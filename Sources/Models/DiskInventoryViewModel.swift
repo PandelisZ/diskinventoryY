@@ -92,9 +92,11 @@ public final class DiskInventoryViewModel {
         let scanID = UUID()
         self.currentScanID = scanID
         
+        self.isScanning = true
         self.currentScanURL = url
         self.selectedItem = nil
         self.scanProgress = nil
+        self.extensionGroups = []
         
         let cacheFile = cacheURL(for: url)
         
@@ -111,9 +113,11 @@ public final class DiskInventoryViewModel {
         }
         
         // 2. Fresh Scan (when no cache exists):
-        self.isScanning = true
-        self.rootItem = nil
-        self.extensionGroups = []
+        // Initialize an empty root item immediately so the splitults view displays on screen right on start!
+        let rootPath = url.standardizedFileURL.path
+        let rootName = url.lastPathComponent
+        let initialRoot = DiskItem(path: rootPath, name: rootName, type: .directory, size: 0, children: [])
+        self.rootItem = initialRoot
         
         let scanner = DiskScanner()
         self.activeScanner = scanner
@@ -126,21 +130,26 @@ public final class DiskInventoryViewModel {
                 }
             }
             
-            let root = await scanner.scan(url: url, skipDependencies: skipDependencies) { [weak self] progress, _ in
+            let root = await scanner.scan(url: url, skipDependencies: skipDependencies) { [weak self] progress, rootItemState in
                 Task { @MainActor in
                     guard let self = self, self.currentScanID == scanID else { return }
-                    // ONLY update progress counters to keep the loading card lag-free!
                     self.scanProgress = progress
+                    
+                    // Update rootItem and extensions "every so often" (every 250ms throttled in sendProgress)
+                    // This forces SwiftUI to re-evaluate the growing tree at a highly optimized, lag-free rate!
+                    self.rootItem = rootItemState
+                    self.updateExtensionGroups(for: rootItemState)
                 }
             }
             
-            // On completion OR cancellation, commit the partially or fully scanned tree!
+            guard !Task.isCancelled else { return }
+            
             Task { @MainActor in
                 guard let self = self, self.currentScanURL == url else { return }
                 if let root = root {
                     self.rootItem = root
                     self.updateExtensionGroups(for: root)
-                    self.autoSaveCache(for: url, root: root) // Auto-save the partial or completed snapshot
+                    self.autoSaveCache(for: url, root: root) // Auto-save completed fresh scan
                 }
             }
         }
@@ -151,7 +160,6 @@ public final class DiskInventoryViewModel {
         guard let url = currentScanURL, let previous = rootItem else { return }
         
         // If it's a manual rescan (not auto-background), cancel previous runs first.
-        // For auto-background, we keep the loaded tree active on screen!
         if !isAutoBackgroundRescan {
             cancelActiveScan()
         }
@@ -179,11 +187,9 @@ public final class DiskInventoryViewModel {
                     guard let self = self, self.currentScanID == scanID else { return }
                     self.scanProgress = progress
                     
-                    // Only update the tree structure live if this is NOT a silent background rescan.
-                    if !isAutoBackgroundRescan {
-                        self.rootItem = rootItemState
-                        self.updateExtensionGroups(for: rootItemState)
-                    }
+                    // Update the tree structure "every so often" (every 250ms throttled flushes)
+                    self.rootItem = rootItemState
+                    self.updateExtensionGroups(for: rootItemState)
                 }
             }
             
