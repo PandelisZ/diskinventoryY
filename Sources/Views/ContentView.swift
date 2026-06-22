@@ -62,64 +62,32 @@ public struct ContentView: View {
                                 
                                 Divider()
                                 
-                                List(selection: $viewModel.selectedItem) {
-                                    OutlineGroup(root, children: \.children) { item in
-                                        HStack(spacing: 8) {
-                                            Image(systemName: item.type == .directory ? "folder.fill" : "doc.fill")
-                                                .font(.system(size: 12))
-                                                .foregroundStyle(item.type == .directory ? .blue : .secondary)
-                                                .frame(width: 14)
-                                            
-                                            Text(item.name)
-                                                .font(.system(size: 12))
-                                                .lineLimit(1)
-                                            
-                                            Spacer()
-                                            
-                                            // Count of immediate children if directory
-                                            if item.type == .directory {
-                                                Text("\(item.childCount) items")
-                                                    .font(.system(size: 10))
-                                                    .foregroundStyle(.tertiary)
-                                            }
-                                            
-                                            // Human readable size
-                                            Text(formattedSize(item.size))
-                                                .font(.system(size: 11, design: .monospaced))
-                                                .foregroundStyle(.primary)
-                                                .frame(width: 80, alignment: .trailing)
-                                            
-                                            // Visual space ratio bar
-                                            PercentageBar(percentage: item.percentageOfParent)
-                                                .frame(width: 50, height: 6)
-                                                .padding(.leading, 4)
+                            // Custom Tree outline list view with programmatic selection expansion and scroll-to-center
+                            ScrollViewReader { proxy in
+                                List {
+                                    OutlineRow(item: root, selectedItem: $viewModel.selectedItem, expandedPaths: $expandedPaths) { targetFolder in
+                                        viewModel.deepScanFolder(at: targetFolder)
+                                    }
+                                }
+                                .listStyle(.sidebar)
+                                .onChange(of: viewModel.selectedItem) { oldVal, newValue in
+                                    if let selected = newValue {
+                                        // 1. Programmatically expand all parent directories recursively
+                                        var cursor = selected.parent
+                                        while let p = cursor {
+                                            expandedPaths.insert(p.path)
+                                            cursor = p.parent
                                         }
-                                        .contentShape(Rectangle())
-                                        .onTapGesture(count: 2) {
-                                            if item.type == .directory {
-                                                viewModel.deepScanFolder(at: item)
-                                            }
-                                        }
-                                        .tag(item)
-                                        .contextMenu {
-                                            if item.type == .directory {
-                                                Button("Deep Scan Folder") {
-                                                    viewModel.deepScanFolder(at: item)
-                                                }
-                                                Divider()
-                                            }
-                                            
-                                            Button("Reveal in Finder") {
-                                                NSWorkspace.shared.selectFile(item.path, inFileViewerRootedAtPath: "")
-                                            }
-                                            Button("Copy Path") {
-                                                NSPasteboard.general.clearContents()
-                                                NSPasteboard.general.setString(item.path, forType: .string)
+                                        
+                                        // 2. Smoothly scroll the list outline to reveal and center the selected item
+                                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                                            withAnimation(.easeInOut(duration: 0.25)) {
+                                                proxy.scrollTo(selected.path, anchor: .center)
                                             }
                                         }
                                     }
                                 }
-                                .listStyle(.sidebar)
+                            }
                             }
                             .frame(minHeight: 150)
                             
@@ -505,5 +473,104 @@ struct VolumeRow: View {
         .padding(8)
         .background(Color(NSColor.controlBackgroundColor))
         .cornerRadius(6)
+    }
+}
+
+struct OutlineRow: View {
+    let item: DiskItem
+    @Binding var selectedItem: DiskItem?
+    @Binding var expandedPaths: Set<String>
+    let onDeepScan: (DiskItem) -> Void
+    
+    private func formattedSize(_ bytes: Int64) -> String {
+        ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+    }
+    
+    var body: some View {
+        if item.type == .directory {
+            DisclosureGroup(
+                isExpanded: Binding(
+                    get: { expandedPaths.contains(item.path) },
+                    set: { isExpanded in
+                        if isExpanded {
+                            expandedPaths.insert(item.path)
+                        } else {
+                            expandedPaths.remove(item.path)
+                        }
+                    }
+                )
+            ) {
+                if let children = item.children {
+                    ForEach(children) { child in
+                        OutlineRow(item: child, selectedItem: $selectedItem, expandedPaths: $expandedPaths, onDeepScan: onDeepScan)
+                    }
+                }
+            } label: {
+                rowContent
+            }
+        } else {
+            rowContent
+        }
+    }
+    
+    private var rowContent: some View {
+        HStack(spacing: 8) {
+            Image(systemName: item.type == .directory ? "folder.fill" : "doc.fill")
+                .font(.system(size: 12))
+                .foregroundStyle(item.type == .directory ? .blue : .secondary)
+                .frame(width: 14)
+            
+            Text(item.name)
+                .font(.system(size: 12))
+                .lineLimit(1)
+            
+            Spacer()
+            
+            if item.type == .directory {
+                Text("\(item.childCount) items")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+            }
+            
+            Text(formattedSize(item.size))
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundStyle(.primary)
+                .frame(width: 80, alignment: .trailing)
+            
+            PercentageBar(percentage: item.percentageOfParent)
+                .frame(width: 50, height: 6)
+                .padding(.leading, 4)
+        }
+        .contentShape(Rectangle())
+        .onTapGesture {
+            selectedItem = item
+        }
+        .onTapGesture(count: 2) {
+            if item.type == .directory {
+                onDeepScan(item)
+            }
+        }
+        .id(item.path) // Critical for ScrollViewReader matching!
+        .tag(item)
+        .contextMenu {
+            if item.type == .directory {
+                Button("Deep Scan Folder") {
+                    onDeepScan(item)
+                }
+                Divider()
+            }
+            
+            Button("Reveal in Finder") {
+                NSWorkspace.shared.selectFile(item.path, inFileViewerRootedAtPath: "")
+            }
+            Button("Copy Path") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(item.path, forType: .string)
+            }
+        }
+        .padding(.vertical, 4)
+        .padding(.horizontal, 6)
+        .background(selectedItem?.path == item.path ? Color(NSColor.selectedControlColor).opacity(0.18) : Color.clear)
+        .cornerRadius(4)
     }
 }
