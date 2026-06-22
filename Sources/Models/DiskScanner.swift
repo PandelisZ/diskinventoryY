@@ -363,16 +363,21 @@ public actor DiskScanner {
                             let itemParentPath = fileURL.deletingLastPathComponent().standardizedFileURL.path
                             
                             if isDir {
+                                let isOrbStackSystem = itemParentPath.contains("/OrbStack/docker/images") || 
+                                                       itemParentPath.contains("/OrbStack/docker/containers") || 
+                                                       itemParentPath.contains("/OrbStack/docker/volumes")
+                                
                                 // Smart Skip Option:
                                 // Skip deep scans inside:
                                 // 1) standard massive developer dependency/cache folders, git repos, dist, out
-                                // 2) macOS application bundles (.app) to match Finder's atomic representation!
-                                if skipDependencies && (isSkippedFolder || isAppBundle) {
+                                // 2) macOS application bundles (.app) to match Finder's atomic representation
+                                // 3) OrbStack/Docker internal image, container, and volume filesystems!
+                                if skipDependencies && (isSkippedFolder || isAppBundle || isOrbStackSystem) {
                                     // Calculate total deep size recursively so sizes are 100% accurate on the disk map!
                                     let calculatedSize = self.calculateDeepDirectorySize(at: fileURL)
                                     let placeholderName = isAppBundle 
                                         ? "App bundle contents hidden (Double-click to scan)" 
-                                        : "Deep scan skipped (Double-click to scan)"
+                                        : (isOrbStackSystem ? "Docker filesystem layers hidden (Double-click to scan)" : "Deep scan skipped (Double-click to scan)")
                                     let folderLabel = name // Keep clean (no suffix)
                                     
                                     // Emit folder start and inject a collapsed explanation file inside it
