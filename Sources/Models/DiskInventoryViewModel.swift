@@ -176,6 +176,8 @@ public final class DiskInventoryViewModel {
     public func cancelActiveScan() {
         self.currentScanID = nil
         self.isScanning = false
+        self.rootItem = nil
+        self.extensionGroups = []
         
         scanTask?.cancel()
         scanTask = nil
