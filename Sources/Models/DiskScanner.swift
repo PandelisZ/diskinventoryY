@@ -43,6 +43,10 @@ final class TreeBuilder {
         let now = DispatchTime.now()
         if force || completed || (now.uptimeNanoseconds - lastUIUpdateTime.uptimeNanoseconds) >= uiUpdateIntervalNanoseconds {
             lastUIUpdateTime = now
+            
+            // Sort all directory children descending by size live so the list outline updates sorted in real-time!
+            finalizeAndSort()
+            
             progressHandler(
                 ScanProgress(totalSize: totalSize, fileCount: totalFileCount, currentItemPath: currentPath, isCompleted: completed),
                 rootItem
