@@ -299,7 +299,7 @@ public actor DiskScanner {
                     
                     // Buffer to batch MainActor hop dispatches
                     var eventBuffer: [(ScanEvent, String)] = []
-                    let batchLimit = 60
+                    let batchLimit = 80
                     
                     let flushBuffer = { (currentPath: String) async in
                         if eventBuffer.isEmpty { return }
@@ -320,39 +320,47 @@ public actor DiskScanner {
                         
                         let parentPath = dirURL.standardizedFileURL.path
                         
-                        // List immediate contents of this popped directory (extremely fast, non-recursive)
-                        guard let contents = try? fm.contentsOfDirectory(
+                        // Recurse directories flatly using NSDirectoryEnumerator
+                        guard let enumerator = fm.enumerator(
                             at: dirURL,
                             includingPropertiesForKeys: Array(enumeratorKeys),
                             options: [.skipsHiddenFiles]
                         ) else {
-                            // If unreadable, complete and pop next
                             await self.workerFinished()
                             continue
                         }
                         
-                        var foldersToQueue: [URL] = []
-                        
-                        for childURL in contents {
-                            if await self.checkCancelled() { break }
+                        var fileCheckCount = 0
+                        while let fileURL = enumerator.nextObject() as? URL {
+                            // Double-layer cancellation checks
+                            if Task.isCancelled { break }
+                            fileCheckCount += 1
+                            if fileCheckCount % 120 == 0 {
+                                let cancelled = await self.checkCancelled()
+                                if cancelled { break }
+                            }
                             
-                            let path = childURL.standardizedFileURL.path
-                            let name = childURL.lastPathComponent
-                            let folderName = childURL.lastPathComponent
+                            let path = fileURL.standardizedFileURL.path
+                            let name = fileURL.lastPathComponent
+                            let folderName = fileURL.lastPathComponent
                             
-                            guard let values = try? childURL.resourceValues(forKeys: enumeratorKeys) else {
+                            // Skip the popped dir itself if returned
+                            if path == parentPath { continue }
+                            
+                            guard let values = try? fileURL.resourceValues(forKeys: enumeratorKeys) else {
                                 continue
                             }
                             
                             let isDir = values.isDirectory ?? false
                             let mtime = values.contentModificationDate ?? Date()
                             
+                            // Resolve the exact absolute parent path
+                            let itemParentPath = fileURL.deletingLastPathComponent().standardizedFileURL.path
+                            
                             if isDir {
                                 // Smart Skip Option:
-                                // If skipDependencies is enabled and the directory matches our skiplist:
                                 if skipDependencies && self.skippedFolderNames.contains(folderName) {
-                                    // Calculate immediate size quickly without descending recursively
-                                    let shallowContents = (try? fm.contentsOfDirectory(at: childURL, includingPropertiesForKeys: [.fileSizeKey, .isDirectoryKey], options: [.skipsHiddenFiles])) ?? []
+                                    let shallowContents = (try? fm.contentsOfDirectory(at: fileURL, includingPropertiesForKeys: [.fileSizeKey, .isDirectoryKey], options: [.skipsHiddenFiles])) ?? []
                                     var shallowSize: Int64 = 0
                                     for itemURL in shallowContents {
                                         let fileVals = try? itemURL.resourceValues(forKeys: [.fileSizeKey, .isDirectoryKey])
@@ -362,39 +370,33 @@ public actor DiskScanner {
                                     }
                                     
                                     // Emit folder start and inject a collapsed explanation file inside it
-                                    eventBuffer.append((.directoryStart(path: path, name: name + " (skipped deep scan)", mtime: mtime), parentPath))
+                                    eventBuffer.append((.directoryStart(path: path, name: name + " (skipped deep scan)", mtime: mtime), itemParentPath))
                                     eventBuffer.append((.file(path: path + "/_placeholder_", name: "Deep scan skipped (Double-click to scan)", size: shallowSize, mtime: mtime, ext: "skipped"), path))
+                                    
+                                    enumerator.skipDescendants() // Bypass entering subfolders
                                 }
                                 // 1. APFS-mtime incremental rescan check
                                 else if let cachedNode = savedIndex[path], cachedNode.modificationDate == mtime {
                                     self.relinkParentRefs(for: cachedNode)
-                                    eventBuffer.append((.reuseSubtree(path: path, subtree: cachedNode), parentPath))
+                                    eventBuffer.append((.reuseSubtree(path: path, subtree: cachedNode), itemParentPath))
+                                    enumerator.skipDescendants() // Bypass entering subfolders
                                 } else {
                                     // 2. Hybrid Load Balancing:
-                                    // If depth is shallow (<= 3 levels from root), push onto the centralized queue
-                                    // so other idle CPU cores can steal it. Otherwise, scan recursively right now!
-                                    let depth = childURL.pathComponents.count - rootDepth
+                                    let depth = fileURL.pathComponents.count - rootDepth
                                     if depth <= 3 {
-                                        eventBuffer.append((.directoryStart(path: path, name: name, mtime: mtime), parentPath))
-                                        foldersToQueue.append(childURL)
+                                        // Push onto the shared queue and skip descendants in our current enumerator
+                                        eventBuffer.append((.directoryStart(path: path, name: name, mtime: mtime), itemParentPath))
+                                        await self.pushWork([fileURL])
+                                        enumerator.skipDescendants()
                                     } else {
-                                        // Scan sequentially on this worker thread to keep queueing overhead minimal
-                                        await self.scanSequentially(
-                                            url: childURL,
-                                            parentPath: parentPath,
-                                            savedIndex: savedIndex,
-                                            rootDepth: rootDepth,
-                                            skipDependencies: skipDependencies,
-                                            eventBuffer: &eventBuffer,
-                                            batchLimit: batchLimit,
-                                            flushHandler: flushBuffer
-                                        )
+                                        // Let the enumerator descend recursively on this thread!
+                                        eventBuffer.append((.directoryStart(path: path, name: name, mtime: mtime), itemParentPath))
                                     }
                                 }
                             } else {
                                 let size = Int64(values.fileSize ?? 0)
-                                let ext = childURL.pathExtension.lowercased()
-                                eventBuffer.append((.file(path: path, name: name, size: size, mtime: mtime, ext: ext), parentPath))
+                                let ext = fileURL.pathExtension.lowercased()
+                                eventBuffer.append((.file(path: path, name: name, size: size, mtime: mtime, ext: ext), itemParentPath))
                             }
                             
                             if eventBuffer.count >= batchLimit {
@@ -405,11 +407,6 @@ public actor DiskScanner {
                         // Push directories to queue
                         if !eventBuffer.isEmpty {
                             await flushBuffer(parentPath)
-                        }
-                        
-                        if !foldersToQueue.isEmpty {
-                            // Push folders onto the shared work queue so other cores can scan them
-                            await self.pushWork(foldersToQueue)
                         }
                         
                         // Notify coordinator that we finished scanning this specific directory
@@ -429,91 +426,6 @@ public actor DiskScanner {
         }
         
         return rootItem
-    }
-    
-    /// Recursively scan a deep subdirectory sequentially on a single thread to avoid queue contention
-    private func scanSequentially(
-        url: URL,
-        parentPath: String,
-        savedIndex: [String: DiskItem],
-        rootDepth: Int,
-        skipDependencies: Bool,
-        eventBuffer: inout [(ScanEvent, String)],
-        batchLimit: Int,
-        flushHandler: (String) async -> Void
-    ) async {
-        if Task.isCancelled { return }
-        let cancelled = self.checkCancelled()
-        if cancelled { return }
-        
-        let path = url.standardizedFileURL.path
-        let name = url.lastPathComponent
-        let folderName = url.lastPathComponent
-        
-        let fm = FileManager.default
-        let enumeratorKeys: Set<URLResourceKey> = [.isDirectoryKey, .contentModificationDateKey, .fileSizeKey]
-        
-        guard let values = try? url.resourceValues(forKeys: enumeratorKeys) else { return }
-        let isDir = values.isDirectory ?? false
-        let mtime = values.contentModificationDate ?? Date()
-        
-        if !isDir {
-            let size = Int64(values.fileSize ?? 0)
-            let ext = url.pathExtension.lowercased()
-            eventBuffer.append((.file(path: path, name: name, size: size, mtime: mtime, ext: ext), parentPath))
-            return
-        }
-        
-        // Check Smart Skip for nested sequential files
-        if skipDependencies && self.skippedFolderNames.contains(folderName) {
-            let shallowContents = (try? fm.contentsOfDirectory(at: url, includingPropertiesForKeys: [.fileSizeKey, .isDirectoryKey], options: [.skipsHiddenFiles])) ?? []
-            var shallowSize: Int64 = 0
-            for itemURL in shallowContents {
-                let fileVals = try? itemURL.resourceValues(forKeys: [.fileSizeKey, .isDirectoryKey])
-                if fileVals?.isDirectory == false {
-                    shallowSize += Int64(fileVals?.fileSize ?? 0)
-                }
-            }
-            
-            eventBuffer.append((.directoryStart(path: path, name: name + " (skipped deep scan)", mtime: mtime), parentPath))
-            eventBuffer.append((.file(path: path + "/_placeholder_", name: "Deep scan skipped (Double-click to scan)", size: shallowSize, mtime: mtime, ext: "skipped"), path))
-            return
-        }
-        
-        // Check mtime match
-        if let cachedNode = savedIndex[path], cachedNode.modificationDate == mtime {
-            relinkParentRefs(for: cachedNode)
-            eventBuffer.append((.reuseSubtree(path: path, subtree: cachedNode), parentPath))
-            return
-        }
-        
-        // Enter directory
-        eventBuffer.append((.directoryStart(path: path, name: name, mtime: mtime), parentPath))
-        
-        guard let contents = try? fm.contentsOfDirectory(
-            at: url,
-            includingPropertiesForKeys: Array(enumeratorKeys),
-            options: [.skipsHiddenFiles]
-        ) else {
-            return
-        }
-        
-        for childURL in contents {
-            if eventBuffer.count >= batchLimit {
-                await flushHandler(childURL.path)
-            }
-            
-            await scanSequentially(
-                url: childURL,
-                parentPath: path,
-                savedIndex: savedIndex,
-                rootDepth: rootDepth,
-                skipDependencies: skipDependencies,
-                eventBuffer: &eventBuffer,
-                batchLimit: batchLimit,
-                flushHandler: flushHandler
-            )
-        }
     }
     
     /// Re-links parent references in a reused cached subtree
