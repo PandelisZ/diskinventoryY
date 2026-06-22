@@ -29,6 +29,7 @@ public struct ContentView: View {
     
     // Track expanded nodes in Outline (UUID/Paths)
     @State private var expandedPaths: Set<String> = []
+    @State private var selectedExtensionGroup: FileExtensionGroup? = nil
     
     public init() {}
     
@@ -238,25 +239,31 @@ public struct ContentView: View {
                     } else {
                         List {
                             ForEach(viewModel.extensionGroups) { group in
-                                HStack(spacing: 8) {
-                                    RoundedRectangle(cornerRadius: 3)
-                                        .fill(group.color)
-                                        .frame(width: 12, height: 12)
-                                        .shadow(radius: 0.5)
-                                    
-                                    Text(".\(group.fileExtension)")
-                                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                                    
-                                    Spacer()
-                                    
-                                    VStack(alignment: .trailing, spacing: 2) {
-                                        Text(formattedSize(group.totalSize))
-                                            .font(.system(size: 11, design: .monospaced))
-                                        Text("\(group.fileCount) files")
-                                            .font(.system(size: 9))
-                                            .foregroundStyle(.secondary)
+                                Button {
+                                    selectedExtensionGroup = group
+                                } label: {
+                                    HStack(spacing: 8) {
+                                        RoundedRectangle(cornerRadius: 3)
+                                            .fill(group.color)
+                                            .frame(width: 12, height: 12)
+                                            .shadow(radius: 0.5)
+                                        
+                                        Text(".\(group.fileExtension)")
+                                            .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                                        
+                                        Spacer()
+                                        
+                                        VStack(alignment: .trailing, spacing: 2) {
+                                            Text(formattedSize(group.totalSize))
+                                                .font(.system(size: 11, design: .monospaced))
+                                            Text("\(group.fileCount) files")
+                                                .font(.system(size: 9))
+                                                .foregroundStyle(.secondary)
+                                        }
                                     }
+                                    .contentShape(Rectangle())
                                 }
+                                .buttonStyle(.plain)
                                 .padding(.vertical, 2)
                             }
                         }
@@ -364,6 +371,12 @@ public struct ContentView: View {
                 let homeURL = FileManager.default.homeDirectoryForCurrentUser
                 viewModel.startScan(at: homeURL)
             }
+            .sheet(item: $selectedExtensionGroup) { group in
+                let files = collectFiles(withExtension: group.fileExtension, under: viewModel.rootItem)
+                ExtensionFilesView(group: group, files: files) { targetFile in
+                    viewModel.selectedItem = targetFile
+                }
+            }
         }
     }
     
@@ -427,6 +440,28 @@ public struct ContentView: View {
                 }
             }
         }
+    }
+    
+    private func collectFiles(withExtension ext: String, under root: DiskItem?) -> [DiskItem] {
+        guard let root = root else { return [] }
+        var results: [DiskItem] = []
+        let targetExt = ext.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        
+        func traverse(_ node: DiskItem) {
+            if node.type == .file {
+                let fileExt = node.fileExtension.trimmingCharacters(in: .whitespacesAndNewlines)
+                if fileExt == targetExt || (targetExt == "no extension" && fileExt.isEmpty) {
+                    results.append(node)
+                }
+            } else if let children = node.children {
+                for child in children {
+                    traverse(child)
+                }
+            }
+        }
+        
+        traverse(root)
+        return results.sorted { $0.size > $1.size }
     }
     
     private func showError(title: String, message: String) {
@@ -572,5 +607,139 @@ struct OutlineRow: View {
         .padding(.horizontal, 6)
         .background(selectedItem?.path == item.path ? Color(NSColor.selectedControlColor).opacity(0.18) : Color.clear)
         .cornerRadius(4)
+    }
+}
+
+struct ExtensionFilesView: View {
+    let group: FileExtensionGroup
+    let files: [DiskItem]
+    let onLocate: (DiskItem) -> Void
+    @Environment(\.dismiss) private var dismiss
+    
+    @State private var searchText = ""
+    
+    private func formattedSize(_ bytes: Int64) -> String {
+        ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+    }
+    
+    var filteredFiles: [DiskItem] {
+        if searchText.isEmpty {
+            return files
+        } else {
+            return files.filter { $0.name.localizedCaseInsensitiveContains(searchText) || $0.path.localizedCaseInsensitiveContains(searchText) }
+        }
+    }
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            // Header
+            HStack(spacing: 12) {
+                RoundedRectangle(cornerRadius: 3)
+                    .fill(group.color)
+                    .frame(width: 16, height: 16)
+                
+                Text("Files with Extension .\(group.fileExtension)")
+                    .font(.headline)
+                
+                Spacer()
+                
+                Text("\(group.fileCount) files · \(formattedSize(group.totalSize))")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 20)
+            .padding(.top, 20)
+            .padding(.bottom, 12)
+            
+            Divider()
+            
+            // Search Bar
+            HStack {
+                Image(systemName: "magnifyingglass")
+                    .foregroundStyle(.secondary)
+                TextField("Search files by name or path...", text: $searchText)
+                    .textFieldStyle(.roundedBorder)
+                    .controlSize(.regular)
+                if !searchText.isEmpty {
+                    Button("Clear") {
+                        searchText = ""
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                }
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 10)
+            .background(Color(NSColor.windowBackgroundColor))
+            
+            Divider()
+            
+            // List of Files
+            List {
+                ForEach(filteredFiles) { file in
+                    HStack(spacing: 12) {
+                        Image(systemName: "doc.fill")
+                            .foregroundStyle(.secondary)
+                        
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(file.name)
+                                .font(.system(size: 12, weight: .semibold))
+                            Text(file.path)
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        }
+                        
+                        Spacer()
+                        
+                        Text(formattedSize(file.size))
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundStyle(.primary)
+                            .frame(width: 80, alignment: .trailing)
+                    }
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        onLocate(file)
+                        dismiss()
+                    }
+                    .contextMenu {
+                        Button("Locate in Folder Structure") {
+                            onLocate(file)
+                            dismiss()
+                        }
+                        Divider()
+                        Button("Reveal in Finder") {
+                            NSWorkspace.shared.selectFile(file.path, inFileViewerRootedAtPath: "")
+                        }
+                        Button("Copy Path") {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(file.path, forType: .string)
+                        }
+                    }
+                    .padding(.vertical, 2)
+                }
+            }
+            
+            Divider()
+            
+            // Bottom bar
+            HStack {
+                Text("Click any file to locate it in the directory tree")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                
+                Spacer()
+                
+                Button("Done") {
+                    dismiss()
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.regular)
+            }
+            .padding(16)
+            .background(Color(NSColor.windowBackgroundColor))
+        }
+        .frame(width: 600, height: 450)
     }
 }
