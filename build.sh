@@ -18,6 +18,9 @@ cp .build/release/DiskInventoryY DiskInventoryY.app/Contents/MacOS/
 # Copy the Info.plist
 cp Resources/Info.plist DiskInventoryY.app/Contents/Info.plist
 
+# Copy the AppIcon.icns
+cp Resources/AppIcon.icns DiskInventoryY.app/Contents/Resources/AppIcon.icns
+
 # Make sure executable is runnable
 chmod +x DiskInventoryY.app/Contents/MacOS/DiskInventoryY
 

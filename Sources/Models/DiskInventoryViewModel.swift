@@ -46,11 +46,11 @@ public final class DiskInventoryViewModel {
         
         var volumes: [MountedVolume] = []
         for url in urls {
-            // Resolve standard file reference URL to normal standardized path
-            let standardURL = url.standardizedFileURL
-            guard let values = try? standardURL.resourceValues(forKeys: Set(keys)) else { continue }
+            // Resolve file reference URL to normal standardized path URL using its POSIX path (essential for directory traversal)
+            let resolvedURL = URL(fileURLWithPath: url.path)
+            guard let values = try? resolvedURL.resourceValues(forKeys: Set(keys)) else { continue }
             
-            let name = values.volumeName ?? standardURL.lastPathComponent
+            let name = values.volumeName ?? resolvedURL.lastPathComponent
             let isInternal = values.volumeIsInternal ?? true
             let total = Int64(values.volumeTotalCapacity ?? 0)
             let available = Int64(values.volumeAvailableCapacity ?? 0)
@@ -60,7 +60,7 @@ public final class DiskInventoryViewModel {
             
             volumes.append(MountedVolume(
                 name: name,
-                url: standardURL,
+                url: resolvedURL,
                 totalCapacity: total,
                 availableCapacity: available,
                 isInternal: isInternal

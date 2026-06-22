@@ -31,13 +31,15 @@ public actor DiskScanner {
         self.isCancelled = false
         self.previousRoot = previousRoot
         
-        let rootPath = url.standardizedFileURL.path
-        let rootName = url.lastPathComponent
+        let resolvedURL = URL(fileURLWithPath: url.path)
+        let rootPath = resolvedURL.path
+        let rootName = resolvedURL.lastPathComponent
         
         // Retrieve root attributes
         let resourceValues: URLResourceValues
         do {
-            resourceValues = try url.resourceValues(forKeys: [.isDirectoryKey, .contentModificationDateKey])
+            let keys: Set<URLResourceKey> = [.isDirectoryKey, .contentModificationDateKey]
+            resourceValues = try resolvedURL.resourceValues(forKeys: keys)
         } catch {
             print("Failed to access root URL: \(error.localizedDescription)")
             return nil
@@ -45,7 +47,8 @@ public actor DiskScanner {
         
         guard resourceValues.isDirectory == true else {
             // Root is a file
-            let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize).map { Int64($0) } ?? 0
+            let keys: Set<URLResourceKey> = [.fileSizeKey]
+            let size = (try? resolvedURL.resourceValues(forKeys: keys).fileSize).map { Int64($0) } ?? 0
             let mtime = resourceValues.contentModificationDate ?? Date()
             let fileExt = url.pathExtension.lowercased()
             let fileItem = DiskItem(path: rootPath, name: rootName, type: .file, size: size, modificationDate: mtime, fileExtension: fileExt)
