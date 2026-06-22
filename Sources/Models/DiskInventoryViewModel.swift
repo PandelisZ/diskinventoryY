@@ -34,6 +34,7 @@ public final class DiskInventoryViewModel {
     
     private var activeScanner: DiskScanner? = nil
     private var scanTask: Task<Void, Never>? = nil
+    private var currentScanID: UUID? = nil
     
     public init() {}
     
@@ -85,6 +86,9 @@ public final class DiskInventoryViewModel {
     public func startScan(at url: URL) {
         cancelActiveScan()
         
+        let scanID = UUID()
+        self.currentScanID = scanID
+        
         self.isScanning = true
         self.currentScanURL = url
         self.rootItem = nil
@@ -95,10 +99,17 @@ public final class DiskInventoryViewModel {
         let scanner = DiskScanner()
         self.activeScanner = scanner
         
-        self.scanTask = Task.detached(priority: .userInitiated) {
-            let root = await scanner.scan(url: url) { [weak self] progress, rootItemState in
-                guard let self = self else { return }
+        self.scanTask = Task.detached(priority: .userInitiated) { [weak self, scanID] in
+            defer {
                 Task { @MainActor in
+                    guard let self = self, self.currentScanID == scanID else { return }
+                    self.isScanning = false
+                }
+            }
+            
+            let root = await scanner.scan(url: url) { [weak self] progress, rootItemState in
+                Task { @MainActor in
+                    guard let self = self, self.currentScanID == scanID else { return }
                     self.scanProgress = progress
                     self.rootItem = rootItemState
                     self.updateExtensionGroups(for: rootItemState)
@@ -108,7 +119,7 @@ public final class DiskInventoryViewModel {
             guard !Task.isCancelled else { return }
             
             Task { @MainActor in
-                self.isScanning = false
+                guard let self = self, self.currentScanID == scanID else { return }
                 if let root = root {
                     self.rootItem = root
                     self.updateExtensionGroups(for: root)
@@ -121,6 +132,11 @@ public final class DiskInventoryViewModel {
     public func startIncrementalScan() {
         guard let url = currentScanURL, let previous = rootItem else { return }
         
+        cancelActiveScan()
+        
+        let scanID = UUID()
+        self.currentScanID = scanID
+        
         self.isScanning = true
         self.selectedItem = nil
         self.scanProgress = nil
@@ -128,10 +144,17 @@ public final class DiskInventoryViewModel {
         let scanner = DiskScanner()
         self.activeScanner = scanner
         
-        self.scanTask = Task.detached(priority: .userInitiated) {
-            let root = await scanner.scan(url: url, previousRoot: previous) { [weak self] progress, rootItemState in
-                guard let self = self else { return }
+        self.scanTask = Task.detached(priority: .userInitiated) { [weak self, scanID] in
+            defer {
                 Task { @MainActor in
+                    guard let self = self, self.currentScanID == scanID else { return }
+                    self.isScanning = false
+                }
+            }
+            
+            let root = await scanner.scan(url: url, previousRoot: previous) { [weak self] progress, rootItemState in
+                Task { @MainActor in
+                    guard let self = self, self.currentScanID == scanID else { return }
                     self.scanProgress = progress
                     self.rootItem = rootItemState
                     self.updateExtensionGroups(for: rootItemState)
@@ -141,7 +164,7 @@ public final class DiskInventoryViewModel {
             guard !Task.isCancelled else { return }
             
             Task { @MainActor in
-                self.isScanning = false
+                guard let self = self, self.currentScanID == scanID else { return }
                 if let root = root {
                     self.rootItem = root
                     self.updateExtensionGroups(for: root)
@@ -151,14 +174,15 @@ public final class DiskInventoryViewModel {
     }
     
     public func cancelActiveScan() {
+        self.currentScanID = nil
+        self.isScanning = false
+        
         scanTask?.cancel()
         scanTask = nil
         
+        let scanner = activeScanner
         Task {
-            await activeScanner?.cancel()
-            await MainActor.run {
-                self.isScanning = false
-            }
+            await scanner?.cancel()
         }
     }
     
