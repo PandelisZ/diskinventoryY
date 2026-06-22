@@ -112,27 +112,57 @@ public struct ContentView: View {
                         } else {
                             VStack {
                                 Spacer()
-                                HStack {
-                                    Spacer()
-                                    VStack(spacing: 12) {
-                                        Image(systemName: "folder.badge.plus")
-                                            .font(.system(size: 44))
-                                            .foregroundStyle(.secondary)
-                                        Text("No Disk Scanned Yet")
-                                            .font(.headline)
-                                        Text("Click 'Scan Folder' in the toolbar to begin analysis.")
+                                VStack(spacing: 24) {
+                                    VStack(spacing: 6) {
+                                        Image(systemName: "circle.grid.hex")
+                                            .font(.system(size: 40))
+                                            .foregroundStyle(.blue.gradient)
+                                        Text("DiskInventoryY")
+                                            .font(.system(size: 20, weight: .bold))
+                                        Text("Select a volume or folder to begin scanning")
                                             .font(.subheadline)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    
+                                    // List of available disks
+                                    VStack(alignment: .leading, spacing: 8) {
+                                        Text("MOUNTED DISKS")
+                                            .font(.system(size: 10, weight: .bold))
+                                            .foregroundStyle(.secondary)
+                                            .padding(.horizontal, 4)
+                                        
+                                        ScrollView {
+                                            VStack(spacing: 8) {
+                                                ForEach(viewModel.mountedVolumes) { vol in
+                                                    VolumeRow(vol: vol) {
+                                                        viewModel.startScan(at: vol.url)
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        .frame(height: 140)
+                                    }
+                                    .frame(width: 420)
+                                    .padding(12)
+                                    .background(Color(NSColor.windowBackgroundColor).opacity(0.5))
+                                    .cornerRadius(8)
+                                    
+                                    HStack(spacing: 12) {
+                                        Text("Or scan a specific folder:")
+                                            .font(.system(size: 12))
                                             .foregroundStyle(.secondary)
                                         
                                         Button(action: selectFolderToScan) {
-                                            Label("Scan Folder", systemImage: "magnifyingglass")
+                                            Label("Choose Folder...", systemImage: "folder.badge.plus")
                                         }
-                                        .buttonStyle(.borderedProminent)
-                                        .controlSize(.large)
-                                        .padding(.top, 8)
+                                        .buttonStyle(.bordered)
+                                        .controlSize(.regular)
                                     }
-                                    Spacer()
                                 }
+                                .padding(24)
+                                .background(Color(NSColor.windowBackgroundColor))
+                                .cornerRadius(12)
+                                .shadow(color: .black.opacity(0.1), radius: 8, x: 0, y: 4)
                                 Spacer()
                             }
                         }
@@ -383,5 +413,42 @@ public struct ContentView: View {
         alert.alertStyle = .critical
         alert.addButton(withTitle: "OK")
         alert.runModal()
+    }
+}
+
+struct VolumeRow: View {
+    let vol: MountedVolume
+    let onScan: () -> Void
+    
+    private func formattedSize(_ bytes: Int64) -> String {
+        ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+    }
+    
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: vol.isInternal ? "internaldrive" : "externaldrive")
+                .font(.system(size: 20))
+                .foregroundStyle(.blue)
+                .frame(width: 28)
+            
+            VStack(alignment: .leading, spacing: 1) {
+                Text(vol.name)
+                    .font(.system(size: 12, weight: .semibold))
+                Text("\(formattedSize(vol.totalCapacity)) capacity · \(formattedSize(vol.availableCapacity)) available")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+            }
+            
+            Spacer()
+            
+            Button("Scan Disk") {
+                onScan()
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+        }
+        .padding(8)
+        .background(Color(NSColor.controlBackgroundColor))
+        .cornerRadius(6)
     }
 }
