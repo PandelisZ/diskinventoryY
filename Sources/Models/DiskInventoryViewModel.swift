@@ -89,11 +89,27 @@ public final class DiskInventoryViewModel {
         let scanID = UUID()
         self.currentScanID = scanID
         
-        self.isScanning = true
         self.currentScanURL = url
-        self.rootItem = nil
         self.selectedItem = nil
         self.scanProgress = nil
+        
+        let cacheFile = cacheURL(for: url)
+        
+        // 1. Auto-Load Cache Check:
+        if FileManager.default.fileExists(atPath: cacheFile.path),
+           let cachedSession = try? SessionManager.shared.load(from: cacheFile) {
+            print("=== Loaded Cached Scan Session for \(url.path) Instantly! ===")
+            self.rootItem = cachedSession.rootItem
+            self.updateExtensionGroups(for: cachedSession.rootItem)
+            
+            // Automatically launch a silent, APFS-mtime optimized background incremental rescan
+            startIncrementalScan(skipDependencies: skipDependencies, isAutoBackgroundRescan: true)
+            return
+        }
+        
+        // 2. Fresh Scan (when no cache exists):
+        self.isScanning = true
+        self.rootItem = nil
         self.extensionGroups = []
         
         let scanner = DiskScanner()
@@ -123,16 +139,21 @@ public final class DiskInventoryViewModel {
                 if let root = root {
                     self.rootItem = root
                     self.updateExtensionGroups(for: root)
+                    self.autoSaveCache(for: url, root: root) // Auto-save completed fresh scan
                 }
             }
         }
     }
     
     /// Starts an APFS mtime-optimized incremental rescan of the current directory, if we have a root.
-    public func startIncrementalScan(skipDependencies: Bool = true) {
+    public func startIncrementalScan(skipDependencies: Bool = true, isAutoBackgroundRescan: Bool = false) {
         guard let url = currentScanURL, let previous = rootItem else { return }
         
-        cancelActiveScan()
+        // If it's a manual rescan (not auto-background), cancel previous runs first.
+        // For auto-background, we keep the loaded tree active on screen!
+        if !isAutoBackgroundRescan {
+            cancelActiveScan()
+        }
         
         let scanID = UUID()
         self.currentScanID = scanID
@@ -168,6 +189,7 @@ public final class DiskInventoryViewModel {
                 if let root = root {
                     self.rootItem = root
                     self.updateExtensionGroups(for: root)
+                    self.autoSaveCache(for: url, root: root) // Auto-save completed incremental scan
                 }
             }
         }
@@ -263,6 +285,11 @@ public final class DiskInventoryViewModel {
         let tempRoot = root
         self.rootItem = nil
         self.rootItem = tempRoot
+        
+        // Auto-save the merged tree state back to our persistent cache
+        if let currentURL = currentScanURL {
+            autoSaveCache(for: currentURL, root: tempRoot)
+        }
     }
     
     public func cancelActiveScan() {
@@ -277,6 +304,33 @@ public final class DiskInventoryViewModel {
         let scanner = activeScanner
         Task {
             await scanner?.cancel()
+        }
+    }
+    
+    // MARK: - Auto-Caching Helpers
+    
+    private var cacheDirectory: URL {
+        let fm = FileManager.default
+        let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let appDir = appSupport.appendingPathComponent("com.pandelis.DiskInventoryY")
+        try? fm.createDirectory(at: appDir, withIntermediateDirectories: true)
+        return appDir
+    }
+    
+    private func cacheURL(for scanURL: URL) -> URL {
+        let path = scanURL.standardizedFileURL.path
+        // Generate a stable string hash value (DJB2) that persists across different app launches
+        var hash: UInt64 = 5381
+        for char in path.utf8 {
+            hash = ((hash << 5) &+ hash) &+ UInt64(char)
+        }
+        return cacheDirectory.appendingPathComponent("cache_\(hash).diskinvy")
+    }
+    
+    private func autoSaveCache(for url: URL, root: DiskItem) {
+        let file = cacheURL(for: url)
+        Task.detached(priority: .background) {
+            try? SessionManager.shared.save(root, to: file, scanURL: url)
         }
     }
     
